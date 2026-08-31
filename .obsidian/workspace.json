@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "工作/卓锐/01-业务/仓储/发货与出库流程.md",
+                "file": "工作/卓锐/03-模块/前端FMS废弃接口清单.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "发货与出库流程"
+              "title": "前端FMS废弃接口清单"
             }
           }
         ]
@@ -158,7 +158,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "工作/卓锐/01-业务/仓储/发货与出库流程.md",
+                "file": "工作/卓锐/03-模块/前端FMS废弃接口清单.md",
                 "followCursor": true,
                 "showSearch": true,
                 "searchQuery": ""
@@ -208,10 +208,10 @@
   },
   "active": "c7ea6f274e744772",
   "lastOpenFiles": [
+    "工作/卓锐/01-业务/仓储/发货与出库流程.md",
     "工作/卓锐/01-业务/采购/采购生命周期与状态机.md",
     "工作/卓锐/01-业务/采购/采购.md",
     "工作/卓锐/01-业务/仓储/收货与入库流程.md",
-    "工作/卓锐/01-业务/仓储/发货与出库流程.md",
     "工作/卓锐/01-业务/仓储/仓储.md",
     "工作/卓锐/01-业务/财务/财务.md",
     "工作/卓锐/02-系统/系统架构.md",
