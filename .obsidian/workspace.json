@@ -188,11 +188,11 @@
             }
           }
         ],
-        "currentTab": 4
+        "currentTab": 6
       }
     ],
     "direction": "horizontal",
-    "width": 307.5
+    "width": 394.5
   },
   "left-ribbon": {
     "hiddenItems": {
@@ -206,7 +206,7 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "723fd72fd16f5a42",
+  "active": "7e5e10fceebaef21",
   "lastOpenFiles": [
     "工作/卓锐/06-设计决策/nzp656D.tmp",
     "工作/卓锐/06-设计决策/06-设计决策.zip",
