@@ -11,10 +11,14 @@
             "id": "ef4757dc0ed510ce",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "工作/卓锐/06-设计决策/对接领星-调拨单与FBA发货单同步-技术实现方案.md",
+                "mode": "source",
+                "source": false
+              },
               "icon": "lucide-file",
-              "title": "新标签页"
+              "title": "对接领星-调拨单与FBA发货单同步-技术实现方案"
             }
           }
         ]
@@ -76,7 +80,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 302.5
+    "width": 256.5
   },
   "right": {
     "id": "b7650ae036f3da2c",
@@ -202,11 +206,11 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "723fd72fd16f5a42",
+  "active": "ef4757dc0ed510ce",
   "lastOpenFiles": [
-    "工作/卓锐/03-模块/前端FMS废弃接口清单.md",
     "工作/卓锐/90-待确认/对接领星-调拨单与FBA发货单同步-待确认问题清单.md",
     "工作/卓锐/06-设计决策/对接领星-调拨单与FBA发货单同步-技术实现方案.md",
+    "工作/卓锐/03-模块/前端FMS废弃接口清单.md",
     "工作/卓锐/06-设计决策/SRM完工提报并发与数据一致性治理技术方案.md",
     "AGENTS.md",
     "工作/卓锐/06-设计决策/nzp656D.tmp",

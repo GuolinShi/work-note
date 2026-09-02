@@ -1,245 +1,264 @@
 ---
 type: design
 status: pending-confirmation
-last_verified: 2026-09-01
+last_verified: 2026-09-02
 source: PRD+code+lingxing-api-docs
+version: V2
 ---
 
-# 对接领星-调拨单&FBA发货单同步-技术实现方案
+# 对接领星-调拨单&FBA发货单同步-技术实现方案（V2）
 
-> 状态：**待确认**（本阶段仅做需求与实现方案确认，未改动任何代码）
-> 依据：《对接领星-调拨单&FBA发货单同步-PRD》、领星API文档（20260520爬虫版，本地 `lingxing-api/raw-markdown`）、xzy ERP 代码库
-> 待确认问题汇总见 [[对接领星-调拨单与FBA发货单同步-待确认问题清单]]
+> 状态：**待确认**（需求与方案确认阶段，未改动任何代码）
+> 依据：《对接领星-调拨单&FBA发货单同步-PRD》、领星API文档（20260520爬虫版）、xzy ERP 代码库
+> 待确认问题见 [[对接领星-调拨单与FBA发货单同步-待确认问题清单]]
+>
+> **V2 变更摘要**（基于 2026-09-02 确认结论）：
+> 1. 备货单纳入本期范围（移库调拨→非FBA平台仓或第三方仓）
+> 2. 平台仓（whType=4）与第三方仓（whType=2）是不同类型，分类条件按"平台仓或第三方仓"表达；FBA仓=平台仓且平台为亚马逊
+> 3. 领星客户端落位 **xzy-openapi 服务**（wms 经 Feign 调用）
+> 4. **领星同步失败不阻断中台流程**：中台操作照常完成，领星同步异步执行、失败可重试+告警
+> 5. 退运支持部分退运：调拨单按中台退运数量在领星收货并反向调拨同数量
+> 6. 费用口径：调拨单费用创建时提交、不可更改；FBA发货单、备货单费用可通过覆盖接口重推
 
 ## 0. 需求与范围概述
 
 ### 0.1 业务目标
 
-物流人员在中台录入【调拨计划】和【调拨发货单】，发货时将单据单向同步到领星：
+物流人员在中台录入【调拨计划】和【调拨发货单】，发货时将单据单向同步到领星。中台发货单与领星执行单据 **1:1**（领星接口不支持多仓发货），仅同步结果、最晚时机（点击【发货】时）创建领星单据：
 
-| 中台单据场景 | 领星执行单据 | 费用 |
-| --- | --- | --- |
-| 集货调拨（自营仓/供应商仓 之间） | 调拨单（type=2 待收货） | 创建时必传（通常为 0） |
-| 海外调拨（第三方仓/平台仓 → 非FBA平台仓/第三方仓） | 调拨单（type=2 待收货） | 创建时必传（产生费用） |
-| 移库调拨（自营仓/供应商仓 → FBA仓） | FBA发货单（已发货） | 发货后补传（预估+实际） |
-| 海外调拨（第三方仓/平台仓 → FBA仓） | FBA发货单（已发货） | 发货后补传（预估+实际） |
-| 移库调拨（自营仓/供应商仓 → 非FBA平台仓/第三方仓） | 备货单 | **本期不做（PRD未提供备货单接口流程，待确认）** |
+| 中台场景 | 始发仓 | 目的仓 | 领星执行单据 | 费用规则 |
+| --- | --- | --- | --- | --- |
+| 集货调拨 | 自营仓或供应商仓 | 自营仓或供应商仓 | 调拨单（type=2 待收货） | 创建时必传（通常0），**不可更改** |
+| 海外调拨 | 第三方仓或平台仓 | 第三方仓或非FBA平台仓 | 调拨单（type=2 待收货） | 创建时必传，**不可更改** |
+| 海外调拨 | 第三方仓或平台仓 | FBA仓 | FBA发货单（已发货） | 可后补，**可覆盖重推** |
+| 移库调拨 | 自营仓或供应商仓 | FBA仓 | FBA发货单（已发货） | 可后补，**可覆盖重推** |
+| 移库调拨 | 自营仓或供应商仓 | 非FBA平台仓或第三方仓 | 备货单（待收货） | 创建时随传，**可覆盖重推**（UpdateLogistics，待确认 B-16） |
 
-### 0.2 核心设计原则（来自 PRD）
+### 0.2 核心设计原则
 
-1. 单向同步：中台 → 领星，不提供领星回拉中台的定时任务。
-2. 强制覆盖：领星侧字段以中台最新数据为准。
-3. 最晚时机同步、仅同步结果：中台【发货】点击时才创建领星执行单据，领星执行单据与中台发货单 **1:1**（领星接口不支持多仓发货）。
-4. 库存锁定时机：中台创建【待发货】调拨发货单时锁中台库存；领星创建执行单据时锁/扣领星库存。
-5. 异常处理：接口报错通过日志告警/异常事件反馈，不做字段回写。
+1. 单向同步：中台 → 领星，不回拉。
+2. 强制覆盖：领星侧字段以中台最新数据为准（费用覆盖重推同理）。
+3. 最晚时机同步、仅同步结果：点击【发货】才创建领星执行单据。
+4. **领星同步不阻断中台**：中台发货/收货/结束到货/退运等操作按中台事务正常完成；领星同步异步执行，失败进入重试队列并告警（2026-09-02 确认）。
+5. 库存口径：中台创建【待发货】发货单时锁中台库存；领星执行单据创建时扣领星库存（CreateSendedOrder/AddAllocationOrder/CreateInbound status=50 均即时扣减始发仓库存）。
+6. 异常反馈：日志告警+异常事件，不做领星→中台字段回写。
 
 ### 0.3 本期实现范围
 
-- 发货时创建领星【调拨单】（AddAllocationOrder，type=2）
-- 发货时创建领星【已发货发货单】（CreateSendedOrder + searchProcessResult 异步结果查询）
-- 调拨单收货同步：分批收货（partlyReceiveAllocationOrder）/ 全部收货（receiveAllocationOrder）
-- 调拨单结束到货（finishReceiveAllocationOrder）+ 中台收货单【结束到货】功能
-- 发货单收货：中台与领星各自收货，无需同步（FBA 自动同步收货数据）
-- 退运：FBA发货单作废（InvalidShipmentSn）；调拨单"先收货+反向type=1调拨单"撤销法
-- 物流费用：费用录入弹框、按体积重/计费重分摊、费用同步领星（updateListLogistics）
-- 基础数据映射：亚马逊店铺（sid）、仓库（wid）、头程物流渠道（默认物流商）、其他费类型
-- 页面展示：调拨发货单列表【领星单据】【预估物流费】【实际物流费】列及悬浮详情；入库单列表【领星单据】列；收货单状态改名与【取消数】
+- 发货同步：领星【调拨单】（AddAllocationOrder）、【已发货发货单】（CreateSendedOrder+searchProcessResult）、【备货单】（CreateInbound）
+- 收货同步：调拨单分批/全部收货、备货单分批收货、收货后领星IB/入库单号回写
+- 结束到货：调拨单 finishReceiveAllocationOrder、备货单 inboundCompleteReceipt；中台新增【结束到货】功能；FBA发货单不处理领星侧
+- 退运：FBA发货单作废（InvalidShipmentSn）；调拨单"部分收货+反向type=1调拨"；备货单方案待定（B-15）
+- 物流费用：费用弹框+分摊计算；调拨单随创建提交；FBA发货单 updateListLogistics 覆盖；备货单 UpdateLogistics 覆盖
+- 基础数据映射：店铺、仓库、头程物流渠道、其他费类型、产品ID（sku→product_id，备货单创建与分批收货必用）
+- 页面展示：【领星单据】【预估物流费】【实际物流费】列、悬浮详情、费用页签、入库单领星单据列、收货单改名与取消数
 
 ## 1. 需求落地实现步骤清单
 
-> 里程碑按依赖顺序排列；M0/M1 为所有后续工作的前置。每个任务标注：后端(BE)/前端(FE)/DB/配置(CFG)。
+> M0/M1/M2 为前置；涉及两个仓库：`xzy`（wms 业务侧）与 `xzy-openapi`（领星客户端，源码不在本工作区，需跨仓库协同，见 C-12）。
 
 ### M0 准备与确认（0.5周）
 
 | # | 任务 | 类型 | 产出 |
 | --- | --- | --- | --- |
-| 0.1 | 与产品/业务确认《待确认问题清单》全部条目（尤其：备货单场景处理、费用分摊方式锁定时机、发货失败策略、退运数量口径） | 沟通 | 确认结论回填本方案 |
-| 0.2 | 申请领星开放平台 appId/appSecret，确认生产/测试环境与 IP 白名单要求 | 沟通 | 凭据入 Nacos/`t_auth_config` |
-| 0.3 | 核对领星侧基础数据：仓库清单（本地仓/海外仓）、店铺授权、"默认物流商"渠道、其他费类型 | 沟通 | 映射初始数据 |
-| 0.4 | 获取领星接口签名算法权威说明（本地爬虫文档缺 Guidance/TestSign 章节，需联调校准） | 沟通 | 签名实现依据 |
+| 0.1 | 确认《待确认问题清单》V2 剩余条目（备货单退运、备注幂等、部分退运FBA处理等） | 沟通 | 结论回填 |
+| 0.2 | 申请/确认领星 appId、appSecret、签名算法资料（用户后续提供） | 沟通 | 凭据与签名依据 |
+| 0.3 | 核对领星基础数据：本地仓/海外仓清单、店铺授权、默认物流商渠道、其他费类型、产品档案（SKU齐全性） | 沟通 | 映射初始数据 |
+| 0.4 | xzy-openapi 仓库工作项对齐（排期、负责人、分支策略） | 沟通 | 跨仓库计划 |
 
-### M1 领星 OpenAPI 基础组件（1周）
-
-| # | 任务 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 1.1 | 新建 `com.xzy.erp.wms.lingxing` 包：client（HTTP+签名+限流）、config、enums、dto | BE | 建议落在 xzy-wms 服务（见 2.1 架构决策） |
-| 1.2 | Token 管理：access-token 获取（`/api/auth-server/oauth/access-token`）、refresh 续约（每个 refresh_token 只能用一次）、过期前主动刷新、并发取令牌加锁 | BE | 凭据存 `t_auth_config`（serviceProviderCode=LINGXING_ERP），运行态 token 落库+Redis |
-| 1.3 | 签名与公共参数：按领星规则生成 sign，组装 access_token/timestamp/app_key；统一响应解析（code=0 成功） | BE | 签名细节待 0.4 校准 |
-| 1.4 | 限流控制：领星多数接口令牌桶容量=1，客户端内置串行队列/信号量+请求间隔控制 | BE | 防止批量操作打爆限流 |
-| 1.5 | 同步日志表 `t_lx_sync_log` + 请求/响应全量留痕（脱敏） | DB/BE | 问题排查与对账依据 |
-| 1.6 | 重试框架：`t_lx_retry_task`（业务类型+payload+次数+下次执行时间）+ xxl-job 扫描执行 | DB/BE | 收货/结束到货/退运等补偿场景复用 |
-
-### M2 基础数据映射（1周，可与 M1 并行）
+### M1 领星 OpenAPI 基础组件 @ xzy-openapi 服务（1.5周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 2.1 | 店铺映射：调 `BasicData/SellerLists` 全量拉取领星店铺 → 缓存 `t_lx_seller`（sid、seller_id、marketplace_id、status）；与 `gzzr_openapi.t_amazon_seller_channel_config` 按 seller_id+marketplace_id 建立映射 | BE/DB | 每日定时刷新 |
-| 2.2 | 仓库映射：调 `Warehouse/WarehouseLists`（type=1本地仓/3海外仓/4平台仓）→ 缓存 `t_lx_warehouse`；提供中台仓库→领星wid映射维护（复用 `t_warehouse_mapping`，serviceProviderCode=LINGXING_ERP，extWhCode=领星wid） | BE/DB/CFG | FBA目的仓无需映射（由shipmentId决定），始发仓必须映射 |
-| 2.3 | 物流渠道：调 `Logistics/ChannelList` → 缓存 `t_lx_channel`（含 provider、volume_calc_param、billing_type）；按"默认物流商"定位渠道 | BE/DB | 用于按计费重分摊时必传的 logistics_channel_id |
-| 2.4 | 其他费类型：调 `FBA/GetHeadLogisticsFeeTypes` → 缓存 `t_lx_fee_type` | BE/DB | 费用上传 other_fee_arr 必传 fee_type_id |
-| 2.5 | 产品ID映射：调 `Product/ProductLists`（sku_list 批量）→ 缓存 `t_lx_product_map`（sku↔领星product_id） | BE/DB | 调拨单分批收货接口必传 product_id |
+| 1.1 | 领星客户端：HTTP+签名+公共参数（access_token/timestamp/app_key）+统一响应解析（code=0） | openapi | 包路径建议 `com.xzy.openapi.lingxing` |
+| 1.2 | Token 管理：GetToken / RefreshToken（refresh_token 一次性）、提前刷新、并发原子更新；凭据存 `t_auth_config`（serviceProviderCode=LINGXING_ERP） | openapi | |
+| 1.3 | 限流：领星接口令牌桶容量多为1，客户端内置串行队列+请求间隔（≥1s） | openapi | |
+| 1.4 | 接口日志表 `t_lx_sync_log`（openapi 库），请求/响应全量留痕 | openapi/DB | |
+| 1.5 | Feign 契约 @ `xzy-openapi-api`：RemoteLingxingService（建单/收货/作废/费用/基础数据等约18个方法） | api模块 | 见 2.2 |
+
+### M2 基础数据映射（1周，与 M1 并行）
+
+| # | 任务 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| 2.1 | 店铺：SellerLists → `t_lx_seller`（sid/seller_id/marketplace_id），与 `t_amazon_seller_channel_config` 按 seller_id+marketplace_id 映射；每日刷新 | BE/DB | |
+| 2.2 | 仓库：WarehouseLists（type=1本地仓/3海外仓/4平台仓）→ `t_lx_warehouse`；中台仓库↔领星wid映射用 `t_warehouse_mapping`（serviceProviderCode=LINGXING_ERP，extWhCode=领星wid），映射时校验领星仓类型与用途匹配（见 2.3 说明） | BE/DB/CFG | |
+| 2.3 | 物流渠道：ChannelList → `t_lx_channel`；定位"默认物流商"渠道（备货单 logistics_id 必传；按计费重分摊时发货单也必传） | BE/DB | |
+| 2.4 | 其他费类型：GetHeadLogisticsFeeTypes → `t_lx_fee_type` | BE/DB | |
+| 2.5 | 产品ID：ProductLists(sku_list) → `t_lx_product_map`（sku→product_id）；**备货单创建、调拨单分批收货、备货单分批收货均必传 product_id** | BE/DB | |
+
+> 仓库映射用途校验规则：调拨单始发/目的仓须为领星本地仓；FBA发货单始发仓须为领星本地仓；备货单始发仓须为领星本地仓、目的仓须为领星海外仓。映射维护页按用途提示可选仓库类型。
 
 ### M3 调拨计划分类标识（0.5周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 3.1 | `t_wms_allocate` 增加 `allocate_category`（集货调拨/移库调拨/海外调拨）与 `lx_doc_type`（ALLOCATION/FBA_SHIPMENT/STOCKUP/NONE） | DB/BE | 依据始发仓/目的仓 whType + is_fba 判定 |
-| 3.2 | 调拨计划创建/保存时自动计算分类；历史数据刷新脚本 | BE | 分类规则见 5.1 |
-| 3.3 | 调拨发货单生成时继承分类（`t_wms_shipment` 冗余 `lx_doc_type`，驱动发货分支） | BE | |
+| 3.1 | `t_wms_allocate` 增加 `allocate_category`（COLLECT/MOVE/OVERSEA）与 `lx_doc_type`（ALLOCATION/FBA_SHIPMENT/STOCKUP/NONE） | DB/BE | 判定规则见 5.1 |
+| 3.2 | 创建/保存调拨计划时自动计算分类；历史数据刷新脚本 | BE | |
+| 3.3 | 发货单生成时继承 `lx_doc_type`，驱动同步分支 | BE | |
 
 ### M4 物流费用模块（1.5周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 4.1 | 费用表 `t_wms_lx_fee`（按发货单粒度：预估/实际 物流费+其他费+合计、分摊方式、重量快照、同步状态） | DB | 见 3.2 |
-| 4.2 | 重量计算服务：单品体积重=包装长×宽×高/6000/单箱数量；单品计费重=MAX(单品包装重量,体积重)；按发货单明细汇总 | BE | 数据源 `t_pms_product_spec`/`t_pms_package_info`，单位换算注意 |
-| 4.3 | 费用分摊预览接口：输入物流计划总费用+分摊方式，按各发货单重量占比输出分摊明细 | BE | 公式：分摊额=总费用×(本单重量/物流计划全部发货单重量合计) |
-| 4.4 | 费用保存接口：覆盖式写入；领星调拨单类单据仅【待发货】可保存，FBA发货单类【待发货/已发货】均可 | BE | 保存即记录，同步在发货/确认时触发 |
-| 4.5 | 【物流费用】弹框（主单信息+物流计划/SO信息+重量汇总+分摊方式+四项费用编辑+下方发货单分摊预览） | FE | 对应 PRD 两个弹框形态（调拨单类/发货单类） |
-| 4.6 | 发货前置校验：走领星调拨单的发货单，未保存费用禁止发货；费用合计=0 时二次确认提示 | BE/FE | FBA发货单类不校验费用 |
+| 4.1 | 费用表 `t_wms_lx_fee`（发货单粒度：预估/实际的物流费、其他费、合计，分摊方式，重量快照，同步状态） | DB | 见 3.2 |
+| 4.2 | 重量计算服务：单品体积重=包装长×宽×高/6000/单箱数量；单品计费重=MAX(单品包装重量,体积重)；按发货单明细汇总（数据源 `t_pms_product_spec`/`t_pms_package_info`，单位口径见 B-5/B-6） | BE | |
+| 4.3 | 分摊预览接口：物流计划总费用×(本单重量/计划内全部发货单重量合计) | BE | |
+| 4.4 | 费用保存接口：覆盖写入；按钮可见性按单据类型（调拨单类仅待发货；备货单类、FBA发货单类待发货+已发货） | BE | |
+| 4.5 | 【物流费用】弹框（三种形态共用组件，按类型控制字段） | FE | |
+| 4.6 | 发货前置校验：**调拨单类未保存费用禁止发货**（领星侧创建后不可改，PRD 强制）；费用=0 二次确认；备货单类、FBA发货单类不校验 | BE/FE | |
+| 4.7 | 费用同步：保存/确认后按类型推送（调拨单不推，随创建提交；备货单 UpdateLogistics；FBA发货单 updateListLogistics），失败进重试 | BE | |
 
-### M5 发货同步-领星调拨单（1周）
-
-| # | 任务 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 5.1 | 单据关联表 `t_wms_lx_shipment_doc`（中台发货单↔领星单据，1:1 但支持作废后重建的多版本） | DB | 见 3.1 |
-| 5.2 | `ShipmentServiceImpl.shipping` 增加领星分支：lx_doc_type=ALLOCATION 时先调 `AddAllocationOrder`（type=2），成功后再执行中台出库事务 | BE | 失败即阻断发货，详见 5.2 时序 |
-| 5.3 | 调拨单创建参数组装：仓库映射、费用、备注（排柜计划号+物流计划号+SO/物流订单号）、product_list(sku+good_num) | BE | 无需 product_id/fnsku |
-| 5.4 | 创建成功后回查 `getStorageAllocationList` 缓存 item_list 的 product_id 映射 | BE | 供分批收货使用 |
-| 5.5 | 领星单据号回写与列表展示联动 | BE | |
-
-### M6 发货同步-FBA发货单（1.5周，本需求最复杂点）
+### M5 发货同步 @ wms 侧编排（1.5周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 6.1 | `shipping` 领星分支：lx_doc_type=FBA_SHIPMENT 时调 `CreateSendedOrder`，带唯一 `request_flag` | BE | 组装规则见 5.3 |
-| 6.2 | 同步轮询 `searchProcessResult`（2s间隔、上限60s）；成功→执行中台出库事务；明确失败→发货失败回滚 | BE | |
-| 6.3 | 轮询超时处理：发货单置【同步中】锁定态（保持待发货、禁止操作），后台 job 续查；查到成功自动补做出库事务，查到失败解锁 | BE/DB | 新增中间状态，防"领星已扣库存、中台未出库"的不一致 |
-| 6.4 | 店铺/市场/shipmentId/fnsku 取值链校验：allocate.shopId→`t_amazon_seller_channel_config`→seller_id+marketplace_id；shipmentId 取 `t_wms_allocate.shipment_id`；fnsku 取 `t_wms_shipment_item.fnsku` | BE | 缺失即拦截并提示 |
-| 6.5 | head_fee_type 与 logistics_channel_id 组装（与费用分摊方式联动） | BE | 见 5.3.5 与待确认 C-6 |
+| 5.1 | 单据关联表 `t_wms_lx_shipment_doc` + 同步任务表 `t_lx_sync_task`（含重试） | DB | 见 3.1/3.4 |
+| 5.2 | 发货后置同步编排：`ShipmentServiceImpl.shipping` 事务提交后按 `lx_doc_type` 投递同步任务（不阻断发货） | BE | 统一异步模型见 5.2 |
+| 5.3 | 调拨单参数组装与提交（AddAllocationOrder type=2，费用、备注、sku+good_num） | BE | 见 5.3 |
+| 5.4 | FBA发货单参数组装与提交（CreateSendedOrder + request_flag），轮询 searchProcessResult | BE | 见 5.4 |
+| 5.5 | 备货单参数组装与提交（CreateInbound status=50/40，inbound_order_no=发货单号幂等，product_id 明细） | BE | 见 5.5 |
+| 5.6 | 成功后回写领星单号；调拨单回查 getStorageAllocationList 缓存 product_id 与 IB 单号链路 | BE | |
 
-### M7 费用同步（0.5周）
-
-| # | 任务 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 7.1 | 费用确认时对已发货的 FBA 发货单调 `updateListLogistics` 覆盖式更新（新版头程物流信息） | BE | 预估+实际费用、重量、体积 |
-| 7.2 | 待发货阶段保存的费用随 `CreateSendedOrder` 一并提交（estimate/actual_expenses_list） | BE | 减少一次调用 |
-| 7.3 | 费用同步失败进重试队列+告警；列表展示同步状态 | BE | |
-
-### M8 收货与结束到货同步（1周）
+### M6 收货与结束到货同步（1周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 8.1 | `ReceiptNewController.receive`（手动签收）后：对关联领星调拨单调 `partlyReceiveAllocationOrder`（product_id+本次收货量） | BE | 领星失败不回滚中台收货，进重试队列 |
-| 8.2 | `receiveAll`（全部收货）后调 `receiveAllocationOrder`（orderSnMany） | BE | |
-| 8.3 | 收货成功后回查 `getStorageAllocationList` 取 `inbound_order_sn`（IB单号）回写收货单/入库单 | BE/DB | 入库单列表【领星单据】列数据源 |
-| 8.4 | 新增【结束到货】功能：收货单（待收货/部分收货）可结束；状态→已收货；取消数=未收货；明细加 `cancel_qty`；回写发货单已收/取消数 | BE/DB/FE | PRD：结束到货后发货单无需继续下推收货单 |
-| 8.5 | 【结束到货】时对领星调拨单调 `finishReceiveAllocationOrder`；FBA发货单类不调领星 | BE | |
-| 8.6 | 收货单列表：【未收货】改名【待收货】、状态筛选改多选、列表与明细增加【取消数】列 | FE | |
+| 6.1 | 手动签收后：调拨单 partlyReceiveAllocationOrder / 备货单 inboundBatchesReceipt（均用 product_id+本次收货量），异步+重试 | BE | |
+| 6.2 | 全部收货后：receiveAllocationOrder | BE | |
+| 6.3 | 收货成功后回查领星入库单号（IB）回写收货单/入库单 | BE/DB | |
+| 6.4 | 中台【结束到货】功能：待收货/部分收货可结束；状态→已收货；取消数=未收货；明细加 cancel_qty；回写发货单 | BE/DB/FE | |
+| 6.5 | 结束到货同步：调拨单 finishReceiveAllocationOrder / 备货单 inboundCompleteReceipt；FBA发货单不处理 | BE | |
+| 6.6 | 收货单列表：改名【待收货】、状态多选、取消数列 | FE | |
 
-### M9 退运同步（1周）
+### M7 退运同步（1周）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 9.1 | 在途退运（ReturnOnroad）创建成功后：FBA发货单类调 `InvalidShipmentSn`（isReturnStock=1 恢复库存） | BE | 单据关联置【已作废】，允许后续重新下推发货单再建领星单 |
-| 9.2 | 调拨单类退运：`receiveAllocationOrder` 全部收货 → `AddAllocationOrder` type=1 反向调拨（目的仓→始发仓，费用0）归还库存 | BE | 两步均入重试队列，支持断点续做 |
-| 9.3 | 退运撤销状态展示（领星单据列标注"已作废"） | BE/FE | |
+| 7.1 | 在途退运事务提交后按领星单据类型投递撤销任务（不阻断退运） | BE | |
+| 7.2 | FBA发货单：InvalidShipmentSn（整单作废+恢复库存）；部分退运时"作废原单+按剩余数量重建"（待确认 B-11） | BE | |
+| 7.3 | 调拨单：按退运数量分批收货（领星）→ 反向 type=1 调拨同数量归还，两步断点续做 | BE | 见 5.8.2 |
+| 7.4 | 备货单：方案待定（B-15），本期先仅记录告警不自动处理 | BE | |
+| 7.5 | 关联记录置【已作废】/重建记录；列表展示 | BE/FE | |
 
-### M10 前端页面改造（1.5周，可与 M5~M9 并行）
+### M8 前端页面改造（1.5周，与 M5~M7 并行）
 
 | # | 任务 | 类型 |
 | --- | --- | --- |
-| 10.1 | 调拨发货单列表：【领星单据】列（悬浮弹框）、【预估物流费】【实际物流费】列；操作列【物流费用】按钮（按单据类型与状态控制显隐） | FE |
-| 10.2 | 调拨发货单查看弹框：新增【物流费用】页签 | FE |
-| 10.3 | 收货单列表/明细：改名、多选状态、取消数列、【结束到货】按钮与确认弹框 | FE |
-| 10.4 | 入库单列表：【备注】右侧【领星单据】列（领星IB单） | FE |
+| 8.1 | 调拨发货单列表：【领星单据】列（悬浮弹框：单据类型/单号/同步状态/费用/失败原因）、【预估物流费】【实际物流费】列、操作列【物流费用】按钮（按类型与状态显隐）、同步状态标识（待同步/同步中/失败可重试） | FE |
+| 8.2 | 查看弹框【物流费用】页签；新增费用弹框组件 feeDialog.vue | FE |
+| 8.3 | 收货单：改名、多选、取消数、【结束到货】按钮与确认弹框 | FE |
+| 8.4 | 入库单列表：【备注】右侧【领星单据】列（领星IB单） | FE |
+| 8.5 | 同步失败手动重试入口（列表操作或详情按钮） | FE |
 
-### M11 异常、重试与告警（0.5周，贯穿）
-
-| # | 任务 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 11.1 | 同步失败统一告警（复用工作台消息 `ErrorMsgTypeEnums`，是否加钉钉机器人待确认） | BE | |
-| 11.2 | 定时任务：searchProcessResult 续查、重试队列执行、基础数据每日刷新、孤儿单据对账 | BE | |
-| 11.3 | 对账 job：中台已发货且应同步的单据 vs `t_wms_lx_shipment_doc`，发现缺失即告警 | BE | |
-
-### M12 联调、测试与上线（1.5周）
+### M9 异常、重试与监控（0.5周，贯穿）
 
 | # | 任务 | 类型 | 说明 |
 | --- | --- | --- | --- |
-| 12.1 | 领星沙箱/生产联调：逐接口校准签名、参数、限流 | 联调 | |
-| 12.2 | 场景用例覆盖：三类调拨×发货/收货/部分收货/结束到货/退运/费用（预估+实际）/异常重试/并发发货 | 测试 | 用例清单见第 8 节 |
-| 12.3 | 上线策略：按调拨计划分类灰度（先集货调拨→海外调拨→FBA），存量单据不追溯，仅新单走新流程 | 上线 | |
+| 9.1 | 重试 job：扫描 `t_lx_sync_task` 执行（退避策略），超次数转人工告警 | BE | |
+| 9.2 | 告警：工作台消息（ErrorMsgTypeEnums）+日志；钉钉机器人待确认 C-10 | BE | |
+| 9.3 | 定时任务：token 刷新、基础数据每日刷新、对账（中台应同步单据 vs 关联记录） | BE | |
 
-**总工期估算：约 6~7 周**（1后端+1前端+0.5测试并行；M0 确认事项若拖延将顺延）。
+### M10 联调、测试与上线（1.5周）
+
+| # | 任务 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| 10.1 | 逐接口校准签名、参数、限流（签名资料由用户提供） | 联调 | |
+| 10.2 | 场景用例：三类单据×发货/收货/部分收货/结束到货/退运（全部+部分）/费用/重试/并发 | 测试 | 见第 8 节 |
+| 10.3 | 上线灰度：调拨单→备货单→FBA发货单；存量不追溯 | 上线 | |
+
+**总工期估算：约 7.5~8.5 周**（含 xzy-openapi 跨仓库开发；若 openapi 侧资源不足将顺延）。
 
 ## 2. 总体架构
 
-### 2.1 组件落位（架构决策，待确认 C-1）
-
-领星 OpenAPI 客户端**直接建在 `xzy-wms` 服务**内（`com.xzy.erp.wms.lingxing`），不经过 xzy-openapi 服务中转。理由：
-
-1. 发货操作需要同步拿到领星结果以决定中台事务走向（成功才出库），走 Feign 中转增加一跳超时与分布式事务复杂度；
-2. 本工作区不含 xzy-openapi 服务源码（仅 api 模块），避免跨仓库改动；
-3. 与现有"推送第三方仓"（pushToThirdWh 走 openapi）并存：那套面向海外仓出入库指令，本需求面向领星 ERP 单据，语义不同。
-
-> 若团队要求所有外部对接统一收口 xzy-openapi 服务，则改为：wms 定义 Feign 接口，openapi 服务实现领星 client——需另行排期（跨仓库）。
-
-### 2.2 组件结构（xzy-wms 内）
+### 2.1 组件落位（已确认：xzy-openapi）
 
 ```text
-com.xzy.erp.wms.lingxing
-├── client
-│   ├── LingXingClient.java          // HTTP 执行、签名、公共参数、限流、日志
-│   ├── LingXingTokenManager.java    // token 获取/刷新/缓存（Redis+DB）
-│   └── LingXingRateLimiter.java     // 令牌桶=1 的串行化控制
-├── config
-│   └── LingXingProperties.java      // appId/appSecret/baseUrl（Nacos）
-├── service
-│   ├── LingXingSyncService.java     // 发货/收货/退运/费用 同步编排（对外门面）
-│   ├── LingXingBaseDataService.java // 店铺/仓库/渠道/费类/产品 缓存刷新
-│   ├── LingXingFeeService.java      // 费用计算、分摊、保存、同步
-│   └── LingXingRetryService.java    // 重试队列执行
-├── dto/req/resp                     // 各接口出入参
-├── job                              // xxl-job：token刷新/结果续查/重试/基础数据/对账
-└── enums                            // 单据类型/同步状态/业务类型
+┌────────────────────────────┐        Feign (R<...>)        ┌──────────────────────────────┐
+│ xzy-wms 服务（业务编排）    │ ───────────────────────────▶ │ xzy-openapi 服务（领星客户端） │
+│ · 发货/收货/退运/费用 编排   │                              │ · RemoteLingxingController    │
+│ · t_lx_sync_task 重试队列   │ ◀─────────────────────────── │ · LingXingClient(签名/限流/日志)│
+│ · t_wms_lx_shipment_doc    │          同步返回             │ · LingXingTokenManager        │
+│ · t_wms_lx_fee             │                              │ · t_lx_sync_log / t_auth_config│
+└────────────────────────────┘                              └──────────────┬───────────────┘
+                                                                            │ HTTPS
+                                                                    https://openapi.lingxing.com
 ```
 
-### 2.3 一致性策略总览
+- `xzy-openapi-api`（Feign 契约，属 xzy 仓库）：新增 `RemoteLingxingService` + req/resp DTO。
+- `xzy-openapi`（服务实现，独立仓库）：领星 client、token、签名、限流、接口日志。
+- `xzy-wms`：所有业务编排、同步任务与重试、单据关联、费用；**中台操作一律不因领星失败而回滚**。
 
-| 场景 | 策略 | 失败处理 |
+### 2.2 Feign 契约清单（RemoteLingxingService）
+
+| 分组 | 方法 | 对应领星接口 |
 | --- | --- | --- |
-| 发货-调拨单 | 先领星后中台（领星成功→中台出库事务） | 领星失败：阻断发货；中台事务失败：极端场景，告警+人工（调拨单待收货不可撤销，补偿成本高） |
-| 发货-FBA发货单 | 先领星（异步接口）轮询结果→成功后中台出库事务 | 明确失败：阻断；轮询超时：【同步中】锁定态+后台续查 |
-| 收货/结束到货 | 中台为主：中台事务先成功，领星异步调用 | 领星失败：不回滚中台，进重试队列+告警 |
-| 退运 | 中台退运事务先成功，领星撤销异步执行 | 失败重试队列（调拨单两步撤销记录断点） |
-| 费用上传 | 中台保存成功→同步领星（覆盖式） | 失败重试队列；允许再次编辑触发重推 |
+| 发货 | createAllocationOrder | AddAllocationOrder |
+| 发货 | createSendedOrder / searchProcessResult | CreateSendedOrder / searchProcessResult |
+| 发货 | createStockupOrder | CreateInbound（备货单） |
+| 收货 | partlyReceiveAllocation / receiveAllAllocation / finishReceiveAllocation | 调拨单三个收货接口 |
+| 收货 | batchesReceiptStockup / completeReceiptStockup | 备货单分批收货/结束到货 |
+| 查询 | getAllocationList | getStorageAllocationList（回查IB/product_id/状态） |
+| 退运 | invalidShipment | InvalidShipmentSn |
+| 费用 | updateShipmentLogistics | updateListLogistics（FBA发货单） |
+| 费用 | updateStockupLogistics | UpdateLogistics（备货单） |
+| 基础数据 | sellerLists / warehouseLists / channelList / feeTypes / productLists | 五个基础数据接口 |
+
+### 2.3 异步同步统一模型（wms 侧，核心变更）
+
+所有领星写操作走同一套"任务化"流程，中台事务与领星调用完全解耦：
+
+```text
+中台业务事务（发货/收货/结束到货/退运）提交成功
+  → 写 t_lx_sync_task（bizType+bizId+payload，status=待执行）
+  → 事务后异步立即执行一次（线程池/MQ）：
+       Feign 调 xzy-openapi → 领星
+       ├─ 成功 → 任务置成功；回写关联记录（领星单号等）
+       ├─ 失败(业务错误，如库存不足/映射缺失) → 任务置【待数据补齐】：暂停自动重试，
+       │     告警提示原因；数据补齐后支持手动重试（或数据变更触发重试）
+       └─ 失败(网络/超时/限流) → 任务置【重试中】，退避重试（1min/5min/30min/2h/6h，
+             上限如10次），超限告警转人工
+```
+
+任务状态机：`0待执行 → 1执行中 → 2成功 / 3重试中 / 4待数据补齐 / 5放弃(转人工)`；多步骤任务（退运两步法）用 `step` 字段记录断点。
+
+**幂等保障**
+- FBA发货单：request_flag 唯一且重试复用；结果经 searchProcessResult 查询，绝不重复提交。
+- 备货单：`inbound_order_no`（客户参考号）= 中台发货单号，领星侧唯一约束天然幂等。
+- 调拨单：无原生幂等键 → 提交前先将任务置【执行中】（乐观锁唯一占用），超时未应答的重试须先经 getStorageAllocationList 按（始发仓+目的仓+日期+备注）查重，防重复建单；为此备注末尾追加中台发货单号（待确认 B-12）。
+
+### 2.4 一致性策略总览（V2：全部非阻断）
+
+| 场景 | 中台动作 | 领星动作 | 失败处理 |
+| --- | --- | --- | --- |
+| 发货（三类单据） | 事务正常完成、置已发货 | 异步创建执行单据 | 重试/待数据补齐+告警；列表可查同步状态 |
+| 收货（分批/全部） | 事务正常完成 | 异步收货 | 同上 |
+| 结束到货 | 事务正常完成 | 异步结束到货 | 同上 |
+| 退运 | 事务正常完成 | 异步作废/收货+反向调拨 | 同上（两步断点） |
+| 费用保存 | 保存成功 | 异步覆盖推送（备货单/发货单） | 同上；再次编辑保存会触发重推 |
 
 ## 3. 数据库设计（DDL 草案，以评审为准）
 
-### 3.1 新增：领星单据关联表 `t_wms_lx_shipment_doc`
-
-> 中台发货单与领星执行单据 1:1，但退运作废后可重新下推重建，故按"每次同步一条记录"设计。
+### 3.1 新增：领星单据关联表 `t_wms_lx_shipment_doc`（wms 库）
 
 ```sql
 CREATE TABLE t_wms_lx_shipment_doc (
   id              BIGINT AUTO_INCREMENT PRIMARY KEY,
   shipment_id     BIGINT       NOT NULL COMMENT '中台调拨发货单ID',
   allocate_id     BIGINT       NULL COMMENT '调拨计划ID（冗余）',
-  doc_type        VARCHAR(32)  NOT NULL COMMENT '领星单据类型 ALLOCATION=调拨单 / FBA_SHIPMENT=FBA发货单',
-  lx_order_sn     VARCHAR(64)  NULL COMMENT '领星单号（TF*/SP*）',
+  doc_type        VARCHAR(32)  NOT NULL COMMENT 'ALLOCATION=调拨单 / FBA_SHIPMENT=FBA发货单 / STOCKUP=备货单',
+  lx_order_sn     VARCHAR(64)  NULL COMMENT '领星单号（TF*/SP*/OWS*）',
   request_flag    VARCHAR(64)  NULL COMMENT 'CreateSendedOrder 幂等标识',
-  sync_status     TINYINT      NOT NULL DEFAULT 0 COMMENT '0待同步 1同步中(轮询) 2成功 3失败 4已作废',
-  lx_ib_no        VARCHAR(64)  NULL COMMENT '领星入库单号（调拨单收货后回查）',
+  sync_status     TINYINT      NOT NULL DEFAULT 0 COMMENT '0待同步 1同步中 2成功 3失败 4待数据补齐 5已作废',
+  lx_ib_no        VARCHAR(64)  NULL COMMENT '领星入库单号（收货后回查）',
   error_msg       VARCHAR(1024) NULL,
   invalid_time    DATETIME     NULL COMMENT '作废时间（退运）',
-  create_time     DATETIME, update_time DATETIME,
-  create_by       VARCHAR(64), update_by VARCHAR(64),
-  del_flag        TINYINT DEFAULT 0,
+  create_time DATETIME, update_time DATETIME, create_by VARCHAR(64), update_by VARCHAR(64),
+  del_flag TINYINT DEFAULT 0,
   KEY idx_shipment (shipment_id), KEY idx_flag (request_flag), KEY idx_sn (lx_order_sn)
-) COMMENT '调拨发货单-领星单据关联表';
+) COMMENT '调拨发货单-领星单据关联表（退运重建时新增记录，旧记录保留）';
 ```
 
-### 3.2 新增：发货单物流费用表 `t_wms_lx_fee`
+### 3.2 新增：发货单物流费用表 `t_wms_lx_fee`（wms 库）
 
 ```sql
 CREATE TABLE t_wms_lx_fee (
@@ -256,51 +275,36 @@ CREATE TABLE t_wms_lx_fee (
   volume_weight         DECIMAL(18,4) DEFAULT 0 COMMENT '总体积重KG',
   chargeable_weight     DECIMAL(18,4) DEFAULT 0 COMMENT '总计费重KG',
   lx_sync_status        TINYINT DEFAULT 0 COMMENT '0无需同步 1待同步 2成功 3失败',
-  lx_sync_time          DATETIME NULL, lx_error VARCHAR(1024) NULL,
+  lx_sync_time DATETIME NULL, lx_error VARCHAR(1024) NULL,
   create_time DATETIME, update_time DATETIME, create_by VARCHAR(64), update_by VARCHAR(64),
   del_flag TINYINT DEFAULT 0,
   UNIQUE KEY uk_shipment (shipment_id)
 ) COMMENT '调拨发货单物流费用表';
 ```
 
-### 3.3 新增：同步日志表 `t_lx_sync_log`
+### 3.3 新增：同步任务表 `t_lx_sync_task`（wms 库，编排+重试一体）
 
 ```sql
-CREATE TABLE t_lx_sync_log (
-  id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-  biz_type     VARCHAR(48) NOT NULL COMMENT 'CREATE_ALLOCATION/CREATE_FBA_SHIPMENT/POLL_RESULT/RECEIVE_PART/RECEIVE_ALL/FINISH_RECEIVE/INVALID_SHIPMENT/CANCEL_ALLOCATION/UPDATE_FEE/BASE_DATA',
-  biz_no       VARCHAR(64) NULL COMMENT '中台单号',
-  lx_order_sn  VARCHAR(64) NULL,
-  request_json MEDIUMTEXT, response_json MEDIUMTEXT,
-  status       TINYINT COMMENT '0失败 1成功',
-  error_msg    VARCHAR(2048), cost_time BIGINT,
-  create_time  DATETIME,
-  KEY idx_biz (biz_type, biz_no), KEY idx_time (create_time)
-) COMMENT '领星接口同步日志';
-```
-
-### 3.4 新增：重试任务表 `t_lx_retry_task`
-
-```sql
-CREATE TABLE t_lx_retry_task (
-  id             BIGINT AUTO_INCREMENT PRIMARY KEY,
-  biz_type       VARCHAR(48) NOT NULL,
-  biz_id         BIGINT NOT NULL COMMENT '业务主键（发货单/收货单/退运单ID）',
-  payload        TEXT COMMENT '执行所需上下文JSON',
-  step           VARCHAR(32) DEFAULT 'INIT' COMMENT '多步骤断点（如调拨单撤销：RECEIVED/REVERSED）',
-  status         TINYINT DEFAULT 0 COMMENT '0待执行 1执行中 2成功 3放弃(超次数)',
-  retry_count    INT DEFAULT 0, max_retry INT DEFAULT 10,
-  next_retry_time DATETIME,
-  error_msg      VARCHAR(2048),
+CREATE TABLE t_lx_sync_task (
+  id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+  biz_type        VARCHAR(48) NOT NULL COMMENT 'CREATE_ALLOCATION/CREATE_FBA_SHIPMENT/POLL_FBA_RESULT/CREATE_STOCKUP/RECEIVE_PART_ALLOCATION/RECEIVE_ALL_ALLOCATION/FINISH_RECEIVE_ALLOCATION/RECEIVE_PART_STOCKUP/FINISH_RECEIVE_STOCKUP/INVALID_SHIPMENT/REBUILD_FBA_SHIPMENT/RETURN_ALLOCATION/UPDATE_FEE_SHIPMENT/UPDATE_FEE_STOCKUP',
+  biz_id          BIGINT NOT NULL COMMENT '业务主键（发货单/收货单/退运单ID）',
+  doc_id          BIGINT NULL COMMENT '关联 t_wms_lx_shipment_doc.id',
+  payload         TEXT COMMENT '执行上下文JSON（请求参数快照）',
+  step            VARCHAR(32) DEFAULT 'INIT' COMMENT '多步骤断点（退运：RECEIVED/REVERSED）',
+  status          TINYINT DEFAULT 0 COMMENT '0待执行 1执行中 2成功 3重试中 4待数据补齐 5放弃',
+  retry_count     INT DEFAULT 0, max_retry INT DEFAULT 10,
+  next_retry_time DATETIME NULL,
+  error_msg       VARCHAR(2048) NULL,
   create_time DATETIME, update_time DATETIME,
-  KEY idx_scan (status, next_retry_time)
-) COMMENT '领星同步重试任务表';
+  KEY idx_scan (status, next_retry_time), KEY idx_biz (biz_type, biz_id)
+) COMMENT '领星同步任务表（含重试）';
 ```
 
-### 3.5 新增：领星基础数据缓存表
+### 3.4 新增：领星基础数据缓存表（wms 库，经 openapi Feign 拉取）
 
 ```sql
--- 店铺（SellerLists）
+-- 店铺
 CREATE TABLE t_lx_seller (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   sid BIGINT NOT NULL COMMENT '领星店铺ID',
@@ -311,27 +315,29 @@ CREATE TABLE t_lx_seller (
   UNIQUE KEY uk_seller_mkt (seller_id, marketplace_id)
 ) COMMENT '领星店铺缓存';
 
--- 仓库（WarehouseLists type=1/3/4）
+-- 仓库（WarehouseLists type=1/3/4 全量）
 CREATE TABLE t_lx_warehouse (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   lx_wid BIGINT NOT NULL COMMENT '领星仓库ID',
   name VARCHAR(128), type TINYINT COMMENT '1本地仓 3海外仓 4平台仓 6AWD',
+  sub_type TINYINT NULL COMMENT '海外仓子类型 1无API 2有API（type=3时有效）',
   country_code VARCHAR(16), t_warehouse_code VARCHAR(64), t_status TINYINT,
   sync_time DATETIME, del_flag TINYINT DEFAULT 0,
   UNIQUE KEY uk_wid (lx_wid)
 ) COMMENT '领星仓库缓存';
 
--- 头程物流渠道（ChannelList）
+-- 头程物流渠道
 CREATE TABLE t_lx_channel (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   lx_channel_id BIGINT NOT NULL,
   channel_name VARCHAR(128), billing_type TINYINT, volume_calc_param INT,
   provider_id BIGINT, provider_name VARCHAR(128), enabled TINYINT,
+  is_default TINYINT DEFAULT 0 COMMENT '默认物流商渠道标记（配置项）',
   sync_time DATETIME, del_flag TINYINT DEFAULT 0,
   UNIQUE KEY uk_channel (lx_channel_id)
 ) COMMENT '领星头程物流渠道缓存';
 
--- 其他费类型（GetHeadLogisticsFeeTypes）
+-- 其他费类型
 CREATE TABLE t_lx_fee_type (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   fee_type_id VARCHAR(64) NOT NULL, name VARCHAR(128), remark VARCHAR(512),
@@ -339,7 +345,7 @@ CREATE TABLE t_lx_fee_type (
   UNIQUE KEY uk_fee_type (fee_type_id)
 ) COMMENT '领星其他费类型缓存';
 
--- 产品映射（ProductLists：sku→product_id）
+-- 产品映射（备货单创建/分批收货必用）
 CREATE TABLE t_lx_product_map (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   sku VARCHAR(128) NOT NULL, lx_product_id BIGINT NOT NULL,
@@ -348,339 +354,343 @@ CREATE TABLE t_lx_product_map (
 ) COMMENT '领星产品ID映射缓存';
 ```
 
-> 仓库映射关系复用现有 `t_warehouse_mapping`（whId + serviceProviderCode=LINGXING_ERP + extWhCode=领星wid + authConfigId），不新建表；如需页面化维护，在现有第三方仓映射页扩展。
+> 仓库映射复用 `t_warehouse_mapping`（whId + serviceProviderCode=LINGXING_ERP + extWhCode=领星wid + authConfigId）。
+> 接口级请求/响应日志 `t_lx_sync_log` 落在 **xzy-openapi 服务库**（客户端侧全量留痕），wms 侧只留任务状态与错误摘要。
 
-### 3.6 现有表变更
+### 3.5 现有表变更
 
 | 表 | 变更 | 说明 |
 | --- | --- | --- |
-| `t_wms_allocate` | + `allocate_category` VARCHAR(16)（COLLECT集货/MOVE移库/OVERSEA海外）；+ `lx_doc_type` VARCHAR(32) | 调拨计划分类与下游领星单据类型 |
-| `t_wms_shipment` | + `lx_doc_type` VARCHAR(32)；+ `lx_sync_status` TINYINT（0无需/1待同步/2同步中/3成功/4失败） | 驱动发货分支与列表展示 |
-| `t_wms_receipt_new` | + `cancel_qty` INT DEFAULT 0（主单取消数汇总）；+ `lx_ib_no` VARCHAR(64)（领星入库单号） | 结束到货与领星单据列 |
-| `t_wms_receipt_item` | + `cancel_qty` INT DEFAULT 0 | 明细取消数 |
+| `t_wms_allocate` | + `allocate_category` VARCHAR(16)；+ `lx_doc_type` VARCHAR(32) | 分类与下游单据类型 |
+| `t_wms_shipment` | + `lx_doc_type` VARCHAR(32)；+ `lx_sync_status` TINYINT（0无需/1待同步/2同步中/3成功/4失败重试中/5待数据补齐） | 驱动分支与列表展示 |
+| `t_wms_receipt_new` | + `lx_ib_no` VARCHAR(64) | 领星入库单号 |
+| `t_wms_receipt_item` | + `cancel_qty` INT DEFAULT 0 | 结束到货取消数 |
+| `t_wms_shipment_item` | + `cancel_qty` INT DEFAULT 0 | 结束到货回写发货单取消数（A-6） |
 | `t_wms_inbound` | + `lx_ib_no` VARCHAR(64) | 入库单列表【领星单据】列 |
-| `t_auth_config` | 初始化一条 LINGXING_ERP 凭据（appId/appSecret/token/refreshToken） | 复用现有授权配置表 |
+| `t_auth_config` | 初始化 LINGXING_ERP 凭据（appId/appSecret/token/refreshToken） | openapi 库 |
 
-## 4. 领星接口使用清单
+## 4. 领星接口使用清单（V2）
 
-| 场景 | 接口（本地文档路径） | API Path | 关键参数 | 注意事项 |
-| --- | --- | --- | --- | --- |
-| 令牌 | Authorization/GetToken | /api/auth-server/oauth/access-token | appId/appSecret（form-data） | expires_in≈7199s，提前刷新 |
-| 令牌 | Authorization/RefreshToken | /api/auth-server/oauth/refresh | appId/refreshToken | **每个 refresh_token 只能用一次**，刷新后必须落库新值 |
-| 店铺 | BasicData/SellerLists | /erp/sc/data/seller/lists | 无（GET） | 全量返回；唯一键 sid |
-| 仓库 | Warehouse/WarehouseLists | /erp/sc/data/local_inventory/warehouse | type=1/3/4 | 分页拉全量 |
-| 渠道 | Logistics/ChannelList | /erp/sc/data/local_inventory/channelList | offset/length | 取 provider=默认物流商 的渠道 |
-| 其他费 | FBA/GetHeadLogisticsFeeTypes | /erp/sc/routing/fba/shipment/getHeadLogisticsFeeTypes | 无 | 缓存 |
-| 产品 | Product/ProductLists | /erp/sc/routing/data/local_inventory/productList | sku_list（≤1000） | 返回 data>>id=product_id |
-| 建调拨单 | Warehouse/AddAllocationOrder | /erp/sc/routing/inventoryReceipt/StorageAllocation/addAllocationOrder | type=2、sys_wid/sys_to_wid、freight_fee/other_fee/fee_part_type、product_list(sku/good_num)、remark | 限流1；成功返回 order_sn（TF*）；**创建后费用不可改** |
-| 调拨单列表 | Warehouse/getStorageAllocationList | .../getStorageAllocationList | wid/to_wid/日期/分页 | 返回 item_list(含product_id)、inbound_order_sn(IB单)、status(19待收货/20已完成/30已删除) |
-| 分批收货 | Warehouse/partlyReceiveAllocationOrder | .../partlyReceiveAllocationOrder | order_sn、product_list(**product_id**、received_good_num) | 必须用领星 product_id，非 SKU |
-| 全部收货 | Warehouse/receiveAllocationOrder | .../receiveAllocationOrder | orderSnMany（逗号分隔） | 待收货→已完成，入库仓加库存 |
-| 结束到货 | Warehouse/finishReceiveAllocationOrder | .../finishReceiveAllocationOrder | order_sn | 关闭未收部分 |
-| 撤销调拨单 | Warehouse/CancelStorageAllocationList | /basicOpen/storageAllocationList/cancel | order_sn | **仅待审批/待配货/待调拨可用；待收货不可用**（本方案不用，采用收货+反向法） |
-| 删除调拨单 | Warehouse/DeleteStorageAllocationList | /basicOpen/storageAllocationList/delete | orderSn[] | 同上，仅待审批/待配货/待调拨 |
-| 建FBA发货单 | FBA/CreateSendedOrder | /erp/sc/storage/shipment/createSendedOrder | sys_wid、list(seller_id/marketplace_id/shipment_id/fulfillment_network_sku/sku/num)、head_fee_type、remark、request_flag、head_logistics_list | **异步接口**：扣发货仓库存并创建【已发货】单；需 request_flag 查结果 |
-| 查创建结果 | FBA/searchProcessResult | /erp/sc/routing/storage/shipment/searchProcessResult | request_flag | process_status：0处理中/1成功/2失败；成功返回 order_sn（SP*） |
-| 更新物流费用 | FBA/updateListLogistics | /erp/sc/routing/storage/shipment/updateListLogistics | data[](order_sn、logistics_list_type=1、head_logistics_list) | **覆盖式更新**：tracking_list/预估/实际费用不传也会置空；限流2 |
-| 作废发货单 | FBA/InvalidShipmentSn | /basicOpen/openapi/fbaShipment/shipmentSn/invalid | shipmentNos[]、isReturnStock=1、isReturnStockAux=0、cancelReason | 作废并恢复产品库存 |
-| （备用）货件状态 | FBA/UpdateShipmentActualStatus | .../updateShipmentActualStatus | is_closed、list(sid/shipment_id) | PRD 明确"结束到货领星侧无需处理"，本期不调 |
+| 场景 | 接口（本地文档） | API Path | 关键点 |
+| --- | --- | --- | --- |
+| 令牌 | GetToken / RefreshToken | /api/auth-server/oauth/access-token、/refresh | expires_in≈7199s；refresh_token 一次性 |
+| 店铺 | SellerLists | /erp/sc/data/seller/lists | 全量；唯一键 sid |
+| 仓库 | WarehouseLists | /erp/sc/data/local_inventory/warehouse | type=1本地/3海外/4平台；海外仓 sub_type=1无API/2有API |
+| 渠道 | ChannelList | /erp/sc/data/local_inventory/channelList | 默认物流商渠道（备货单必传、按计费重分摊必传） |
+| 其他费 | GetHeadLogisticsFeeTypes | .../getHeadLogisticsFeeTypes | 缓存 |
+| 产品 | ProductLists | .../local_inventory/productList | sku_list≤1000；返回 product_id |
+| 建调拨单 | AddAllocationOrder | .../StorageAllocation/addAllocationOrder | type=2 待收货；sku+good_num；费用创建后不可改；返回 TF* 单号；限流1 |
+| 建FBA发货单 | CreateSendedOrder | /erp/sc/storage/shipment/createSendedOrder | **异步**；扣发货仓库存；需 request_flag；list 需 seller_id/marketplace_id/shipment_id/fnsku/sku/num |
+| 查创建结果 | searchProcessResult | .../shipment/searchProcessResult | 0处理中/1成功/2失败；成功返回 SP* |
+| 建备货单 | CreateInbound | /erp/sc/routing/owms/inbound/createInbound | **inbound_order_no 唯一（幂等键=发货单号）**；s_wid 仅限本地仓；r_wid 仅限海外仓；product_list 必传 product_id；status 40待发货/50待收货/60已完成；**收货仓为三方海外仓的备货单状态只到待发货（联调验证 B-14）**；返回 OWS* |
+| 备货单发货 | SendInbound | .../owms/inbound/sendInbound | 待发货→待收货并扣库存（本期直接 status=50 创建，备用） |
+| 调拨单列表 | getStorageAllocationList | .../StorageAllocation/getStorageAllocationList | item_list 含 product_id；inbound_order_sn(IB)；status 19待收货/20已完成 |
+| 调拨单收货 | partlyReceiveAllocationOrder / receiveAllocationOrder | 同前缀 | 分批必传 product_id；全部收货传 orderSnMany |
+| 调拨单结束到货 | finishReceiveAllocationOrder | 同前缀 | order_sn |
+| 备货单收货 | inboundBatchesReceipt | /erp/sc/routing/owms/inbound/batchesReceipt | overseas_order_no + product_id + current_receive_num |
+| 备货单结束到货 | inboundCompleteReceipt | .../inbound/completeReceipt | overseas_order_no |
+| 更新发货单费用 | updateListLogistics | .../shipment/updateListLogistics | **覆盖式**（不传也置空）；限流2 |
+| 更新备货单费用 | UpdateLogistics | .../owms/inbound/updateLogistics | 覆盖式；旧版/新版物流信息均支持 |
+| 作废发货单 | InvalidShipmentSn | /basicOpen/openapi/fbaShipment/shipmentSn/invalid | shipmentNos[]；isReturnStock=1 恢复库存 |
+| 删除备货单 | DeleteOverSeaStockOrder | /basicOpen/overSeaWarehouse/stockOrder/delete | 仅待审批/待配货/待发货/已驳回可删（**待收货不可删**，退运不能依赖此接口） |
+| （备用）编辑发货单 | updateInboundShipmentListMws | .../shipment/updateInboundShipmentListMws | 发货量不允许大于计划量，已发货单适用性存疑，仅备用 |
+| （备用）货件状态 | UpdateShipmentActualStatus | 同前缀 | PRD 明确结束到货不调，本期不用 |
 
-> 限流：上述业务接口令牌桶容量多为 1（updateListLogistics 为 2）。客户端按 2.2 的 RateLimiter 串行化；批量场景（如收货重试队列）按每请求 ≥1s 间隔执行。
-
-## 5. 业务流程详细设计
+## 5. 业务流程详细设计（V2）
 
 ### 5.1 调拨计划分类判定
 
-在调拨计划创建/保存时按始发仓、目的仓类型计算（仓库类型取 `t_wms_warehouse.wh_type`：1自营、2第三方、3供应商、4FBA）：
+仓库类型取 `t_wms_warehouse.wh_type`：1自营、2第三方、3供应商、**4平台仓**。平台仓中 **平台=亚马逊（platformId=AMAZON）为 FBA 仓，其余为非FBA平台仓**（代码中已有该判定：`PlatformEnums.AMAZON.getId().equals(warehouse.getPlatformId())`）。
+
+> 规则表达遵循确认口径：平台仓与第三方仓是不同类型，处理一致时条件写为"平台仓或第三方仓"。
 
 ```text
-始发仓 ∈ {自营(1), 供应商(3)} 且 目的仓 ∈ {自营(1), 供应商(3)}
-    → 集货调拨 COLLECT    → lx_doc_type = ALLOCATION（调拨单，费用通常0）
-始发仓 ∈ {自营(1), 供应商(3)} 且 目的仓 = FBA(4)
-    → 移库调拨 MOVE       → lx_doc_type = FBA_SHIPMENT（发货单）
-始发仓 ∈ {自营(1), 供应商(3)} 且 目的仓 = 第三方(2，非FBA)
-    → 移库调拨 MOVE       → lx_doc_type = STOCKUP（备货单，本期不同步，仅打标，待确认 A-1）
-始发仓 ∈ {第三方(2)} 且 目的仓 = FBA(4)
-    → 海外调拨 OVERSEA    → lx_doc_type = FBA_SHIPMENT（发货单，产生费用）
-始发仓 ∈ {第三方(2)} 且 目的仓 = 第三方(2，非FBA)
-    → 海外调拨 OVERSEA    → lx_doc_type = ALLOCATION（调拨单，产生费用）
+集货调拨 COLLECT：
+  始发仓 ∈ {自营仓, 供应商仓} 且 目的仓 ∈ {自营仓, 供应商仓}
+  → lx_doc_type = ALLOCATION（调拨单，费用通常0，创建后不可改）
+
+移库调拨 MOVE：
+  始发仓 ∈ {自营仓, 供应商仓} 且 目的仓 = FBA仓（平台仓且平台=亚马逊）
+  → lx_doc_type = FBA_SHIPMENT（发货单，费用可覆盖）
+  始发仓 ∈ {自营仓, 供应商仓} 且 目的仓 ∈ {非FBA平台仓, 第三方仓}
+  → lx_doc_type = STOCKUP（备货单，费用可覆盖【B-16待确认】）
+
+海外调拨 OVERSEA：
+  始发仓 ∈ {第三方仓, 平台仓（含FBA仓与非FBA平台仓）} 且 目的仓 = FBA仓
+  → lx_doc_type = FBA_SHIPMENT（发货单，产生费用）
+  始发仓 ∈ {第三方仓, 平台仓（含FBA仓与非FBA平台仓）} 且 目的仓 ∈ {非FBA平台仓, 第三方仓}
+  → lx_doc_type = ALLOCATION（调拨单，产生费用，创建后不可改）
 ```
 
-- `is_fba` 沿用现有字段（目的仓是否FBA），与分类互为校验。
-- 分类结果冗余到下游发货单（`t_wms_shipment.lx_doc_type`），发货时直接据此分支，不再重算。
-- 平台仓（非FBA，如 Wayfair/Lazada 平台仓）在中台 `wh_type` 的归类口径待确认（A-2）。
+- `is_fba`（目的仓是否FBA）与分类互为校验；分类冗余到发货单，发货时直接分支。
+- 海外调拨以 FBA 仓为始发仓时（如滞销转移），领星调拨单能否以平台仓为出库仓需联调验证（B-17）。
 
-### 5.2 发货同步-领星调拨单（ALLOCATION）
-
-**前置校验（发货点击时）**
-1. 发货单状态=待发货、装箱信息齐全（现有逻辑）。
-2. 费用已保存（强制，因领星调拨单创建后费用不可改）；若 `actual_total_fee=0` 前端二次确认："当前发货单物流费用为0，领星调拨单创建后不支持修改费用，请确认费用是否正确？"。
-3. 始发仓/目的仓已完成领星仓库映射，否则拦截提示去维护映射。
-
-**时序（两阶段，避免领星孤儿单）**
+### 5.2 发货同步总流程（三类共用骨架）
 
 ```text
-[阶段1 领星创建（事务外）]
-1. t_wms_lx_shipment_doc 预写一条 sync_status=1（同步中）
-2. 调 AddAllocationOrder：
-   - type=2（完整调拨→待收货）
-   - sys_wid / sys_to_wid = 映射的领星仓库ID
-   - freight_fee = actual_logistics_fee，other_fee = actual_other_fee，fee_part_type=0（不分摊，中台已分摊到发货单粒度，待确认 B-3）
-   - remark = 排柜计划号 + 物流计划号 + SO/物流订单号（无则留空拼接）
-   - product_list[]：sku、good_num=shipmentQty（本期不传次品，待确认 B-4）
-3. 成功：得到 order_sn；失败：预写记录置失败+错误信息 → 抛业务异常，发货终止（中台未出库，可整改后重发）
-
-[阶段2 中台出库事务（现有发货逻辑）]
-4. 同一事务内：始发仓出库 → 发货单置已发货 → 回写关联记录(sync_status=2, lx_order_sn) → 重算物流计划
-5. 事务成功后异步：调 getStorageAllocationList 缓存该单 item_list 的 product_id（供分批收货）
-
-[异常分支]
-- 阶段2事务失败（概率极低）：领星调拨单已成【待收货】，无法撤销 → 记录日志+告警，
-  人工处理口径=退运流程（先收货再反向调拨），见 5.6.2
+【发货点击】
+1. 现有校验与中台事务：装箱校验 → 始发仓出库 → 发货单置已发货 → 重算物流计划（与现状一致）
+   · 调拨单类额外前置校验：费用已保存（未保存则拦截发货——这是数据完备性校验，非领星同步失败；
+     费用合计=0 时前端二次确认）
+2. 事务提交后按 lx_doc_type 创建 t_lx_sync_task（CREATE_*）+ 预写 t_wms_lx_shipment_doc（待同步）
+3. 异步执行器领取任务 → Feign 调 openapi → 领星（细节见 5.3/5.4/5.5）
+4. 成功：回写领星单号，发货单 lx_sync_status=成功
+   失败：按 2.3 策略重试/待数据补齐+告警；中台单据保持已发货，不受影响
+5. 列表始终展示同步状态；失败提供手动重试入口
 ```
 
-### 5.3 发货同步-领星FBA发货单（FBA_SHIPMENT）
+### 5.3 发货 → 领星调拨单（ALLOCATION）
 
-**前置校验**
-1. 状态=待发货、装箱齐全（现有）。费用**不校验**（可后补）。
-2. 始发仓已映射领星仓库；店铺映射齐全：`allocate.shopId` → `t_amazon_seller_channel_config` 取得 seller_id、marketplace_id；`allocate.shipment_id`（FBA货件号）非空；明细 `fnsku` 非空。任一缺失即拦截。
+**参数组装（AddAllocationOrder）**
 
-**组装 CreateSendedOrder**
-
-| 领星参数 | 中台来源 |
+| 领星参数 | 取值 |
 | --- | --- |
-| sys_wid | 始发仓映射的领星仓库ID |
+| type | 2（完整调拨→待收货） |
+| sys_wid / sys_to_wid | 始发/目的仓映射的领星本地仓ID |
+| freight_fee / other_fee | 费用表实际物流费 / 实际其他费 |
+| fee_part_type | 0（不分摊：中台已分摊到发货单粒度，B-3） |
+| remark | 排柜计划号+物流计划号+SO/物流订单号 [+中台发货单号，B-12待确认] |
+| product_list[].sku / good_num | 发货明细 sku / shipmentQty（本期不传次品，B-4） |
+
+**执行与幂等**
+- 任务置执行中（乐观锁唯一占用）→ 调用 → 成功写 TF* 单号。
+- 超时未应答的重试：先按（始发仓+目的仓+日期+备注）查 getStorageAllocationList 判重，已存在则直接取单号置成功，否则重新提交。
+- 成功后异步回查该单 item_list，缓存 sku→product_id 到 `t_lx_product_map`（分批收货用）。
+
+**常见失败原因处理**
+- 映射缺失（仓库未映射）→ 待数据补齐：维护映射后手动重试。
+- 领星库存不足 → 告警人工核对领星库存（中台已出库，领星账差异需人工决策，见 7.1 对账）。
+
+### 5.4 发货 → 领星FBA发货单（FBA_SHIPMENT）
+
+**前置数据链（缺失则任务置"待数据补齐"，不阻塞中台发货）**
+- 始发仓→领星本地仓映射；`allocate.shopId`→`t_amazon_seller_channel_config`→seller_id+marketplace_id；`allocate.shipmentId`（FBA货件号）非空；明细 fnsku 非空。
+
+**参数组装（CreateSendedOrder）**
+
+| 领星参数 | 取值 |
+| --- | --- |
+| sys_wid | 始发仓映射的领星本地仓ID |
 | actual_shipment_time | 发货当日 |
 | expected_arrival_date | allocate.planArrivalDate |
+| head_fee_type | 与费用分摊方式联动：体积重→2；计费重→0且传 logistics_channel_id（默认物流商渠道）；未录费用默认 2（体积重）。**分摊方式在创建时锁定，费用金额可后续覆盖**（C-6已确认口径） |
 | remark | 排柜计划号+物流计划号+SO/物流订单号 |
-| head_fee_type | 与费用分摊方式联动：体积重→2；计费重→0 且必传 logistics_channel_id（默认物流商渠道，见 4）；未录费用时默认传 2（待确认 C-6） |
-| request_flag | `{shipmentNo}_{yyyyMMddHHmmss}_{rand}`，保证唯一（超时续查依赖） |
-| list[].seller_id | t_amazon_seller_channel_config.sellerId |
-| list[].marketplace_id | t_amazon_seller_channel_config.marketPlaceId |
+| request_flag | `{shipmentNo}_{时间戳}_{rand}`，重试复用同一标识 |
+| list[].seller_id / marketplace_id | t_amazon_seller_channel_config |
 | list[].shipment_id | allocate.shipmentId（=发货单 inboundNo） |
-| list[].fulfillment_network_sku | shipment_item.fnsku |
-| list[].sku / num | shipment_item.sku / shipmentQty |
-| head_logistics_list | 若发货前已录费用：带预估+实际费用（见 5.4.5）；否则不传 |
+| list[].fulfillment_network_sku / sku / num | shipment_item.fnsku / sku / shipmentQty |
+| head_logistics_list | 发货前已录费用则随单提交（预估+实际）；否则不传 |
 
-**结果轮询与状态机**
-
+**结果处理（任务内完成轮询）**
 ```text
-发货点击 → 预写关联记录(同步中, request_flag) → CreateSendedOrder
-   ├─ 同步调用失败(网络/参数错) → 发货终止，可重试
-   └─ 已受理 → 轮询 searchProcessResult（间隔2s，上限60s）
-        ├─ process_status=1 → 中台出库事务（同 5.2 阶段2）→ 完成
-        ├─ process_status=2 → 发货终止，展示 error_details
-        └─ 超时未出结果 → 发货单置【同步中】锁定态：
-              · shipment_status 保持待发货，前端禁用发货/截单/编辑按钮
-              · 后台 job 每 30s 续查（最长 24h）
-              · 查到成功 → 自动执行中台出库事务并解锁
-              · 查到失败 → 解锁，允许重新发货
-              · 24h 仍处理中 → 告警人工介入（核对领星后台该 request_flag 单据）
+调用 CreateSendedOrder
+ ├─ 受理前失败（参数/网络）→ 重试策略
+ └─ 已受理 → 任务转 POLL_FBA_RESULT，轮询 searchProcessResult（2s间隔，单轮上限60s；
+      未出结果则任务重新入队，下一轮继续，最长24h）
+      ├─ process_status=1 → 写 SP* 单号，成功
+      ├─ process_status=2 → 记录 error_details；按错误性质转【待数据补齐】或继续重试
+      └─ 24h 未出结果 → 放弃+告警，人工到领星后台按 request_flag 核对
 ```
+> 因 request_flag 幂等+只查不重发，轮询期间不存在重复建单风险；中台发货单始终可正常操作。
 
-> 该设计目的：CreateSendedOrder 一旦受理就会扣领星库存，绝不能出现"领星已扣、中台未出库"或"重复创建"。request_flag 保证超时重查幂等；锁定态禁止二次发货防止重复建单。
+### 5.5 发货 → 领星备货单（STOCKUP）
 
-### 5.4 物流费用模块
+**前置数据链**
+- 始发仓→领星**本地仓**映射（s_wid 仅限本地仓；供应商仓是否存在于领星本地仓见 B-13）；
+- 目的仓→领星**海外仓**映射（r_wid 仅限海外仓；注意海外仓 sub_type 影响状态上限，见 B-14）；
+- 明细 sku→product_id（`t_lx_product_map`，缺失即待数据补齐）；
+- 默认物流商渠道 logistics_id（必传）。
 
-**5.4.1 重量计算（分摊基础）**
+**参数组装（CreateInbound）**
 
-数据源：`t_pms_product_spec`（包装长/宽/高、净重/毛重、单品体积重）与 `t_pms_package_info`（默认箱规：包装尺寸、单箱数量）。计算口径（与 PRD 一致）：
-
-```text
-单品体积重(KG) = 包装长(cm) × 包装宽(cm) × 包装高(cm) / 6000 / 单箱数量
-单品计费重(KG) = MAX(单品包装重量, 单品体积重)
-发货单总实重   = Σ(单品包装重量 × 发货数量)
-发货单总体积重 = Σ(单品体积重 × 发货数量)
-发货单总计费重 = Σ(单品计费重 × 发货数量)
-```
-
-> 待确认：单品包装重量取净重还是毛重（B-5）；无箱规/无尺寸的产品按 0 计还是拦截（B-6）；尺寸单位以哪个表为准（spec 标注 mm、package_info 标注 cm，需统一口径）。
-> 无物流计划的发货单，只计算发货单自身（PRD 已说明）。
-
-**5.4.2 分摊算法**
-
-```text
-单发货单分摊费用 = 物流计划总费用 × ( 本发货单重量 / 物流计划下全部发货单重量合计 )
-分摊方式：调拨单类仅【体积重】；FBA发货单类支持【体积重/计费重】，默认体积重
-```
-
-**5.4.3 费用弹框（前端交互）**
-
-- 弹框上：发货单主单信息；中：物流计划单+SO/物流订单号（无则留空）+总实重/体积重/计费重；分摊方式选择；四项费用编辑（物流费预估/其他费预估/物流费实际/其他费实际，调拨单类仅两项实际）；自动算合计；下：物流计划下全部发货单及各重量，录入总费用时实时预览分摊结果。
-- 【确定】：覆盖写入 `t_wms_lx_fee`。
-- 按钮显隐：调拨单类仅【待发货】；FBA发货单类【待发货+已发货】。
-
-**5.4.4 费用同步领星**
-
-| 单据类型 | 同步时机与方式 |
+| 领星参数 | 取值 |
 | --- | --- |
-| 调拨单类 | 费用只在 `AddAllocationOrder` 创建时随单提交（freight_fee/other_fee），创建后**不可再改**；因此发货后弹框隐藏，中台侧仅留记录 |
-| FBA发货单类（待发货时录入） | 随 `CreateSendedOrder` 的 head_logistics_list 提交 |
-| FBA发货单类（已发货后录入/修改） | 调 `updateListLogistics`（覆盖式），失败进重试队列；每次【确定】都重推（覆盖上次费用，与 PRD 一致） |
+| inbound_order_no | **中台发货单号（唯一幂等键）** |
+| s_wid / r_wid | 始发本地仓 / 目的海外仓映射ID |
+| status | 50（待收货）；若目的为三方海外仓且联调确认状态只到待发货，则 40（B-14） |
+| logistics_id | 默认物流商渠道ID |
+| share_id | 与费用分摊方式联动：0计费重/2体积重（同 5.4 口径） |
+| estimated_time | allocate.planArrivalDate |
+| remark | 排柜计划号+物流计划号+SO/物流订单号 |
+| logistics_list（旧版） | 已录费用则随传：logistics_order_no=SO/物流订单号、logistics_money=预估物流费、other_money=预估其他费、real_*=实际费用；币种 CNY（C-7） |
+| product_list[].product_id / stock_num / receive_num | product_id 映射 / shipmentQty / 0 |
 
-**5.4.5 updateListLogistics 参数组装**
+**执行与幂等**：inbound_order_no 唯一约束保证重试安全；成功回写 OWS* 单号。
 
-```text
-data[0].order_sn = lx_order_sn
-data[0].logistics_list_type = 1（新版）
-data[0].head_logistics_list:
-  tracking_list = []（SO号是否作为跟踪号同步，待确认 C-8）
-  estimate_expenses_list:
-    logistics_fee = 物流费用(预估)，logistics_fee_currency = CNY（待确认 C-7）
-    price = 单价（口径待确认 C-7，建议 预估物流费/计费重，无法计算时传0）
-    other_fee_arr = [{ fee_type_id=默认"其他费用"类型, other_amount=其他费用(预估), other_currency=CNY }]
-  actual_expenses_list:
-    logistics_fee = 物流费用(实际)，weight = 总实重，volume = 总体积(m³)，
-    tax_fee = 0（本期无关税），price/other_fee_arr 同上（实际口径）
-```
+### 5.6 物流费用模块（V2：三类单据三种行为）
 
-> 注意覆盖式语义：每次必须把预估与实际两组都完整传，否则未传部分被置空。
-
-**5.4.6 页面展示**
-- 列表新增【预估物流费】【实际物流费】列，取 `t_wms_lx_fee` 合计值。
-- 查看弹框新增【物流费用】页签，展示费用明细+分摊方式+同步状态。
-
-### 5.5 收货同步
-
-**5.5.1 分批收货（手动签收）**
+**5.6.1 重量计算与分摊（同 V1）**
 
 ```text
-中台：ReceiptNewController.receive 事务成功（中台为主）
-  → 发货单存在有效领星调拨单（doc_type=ALLOCATION, sync_status=2, 未作废）？
-      是 → 调 partlyReceiveAllocationOrder：
-           order_sn = lx_order_sn
-           product_list[]：product_id（t_lx_product_map / 建单时缓存）、
-                           received_good_num = 本次该SKU签收数
-      失败 → 写重试队列（不回滚中台收货）+ 告警
-      否（FBA发货单类）→ 不调领星（FBA自动收货）
+单品体积重(KG) = 包装长(cm)×包装宽(cm)×包装高(cm) / 6000 / 单箱数量
+单品计费重(KG) = MAX(单品包装重量, 单品体积重)
+单发货单分摊费用 = 物流计划总费用 × (本发货单重量 / 计划内全部发货单重量合计)
+分摊方式：调拨单类仅【体积重】；备货单类、FBA发货单类支持【体积重/计费重】，默认体积重
+无物流计划的发货单只计算自身（PRD）
 ```
 
-**5.5.2 全部收货**：`receiveAll` 后调 `receiveAllocationOrder(orderSnMany=lx_order_sn)`；成功后回查 `getStorageAllocationList` 取 `inbound_order_sn` 写入 `t_wms_receipt_new.lx_ib_no` 与对应 `t_wms_inbound.lx_ib_no`（按收货单→入库单链路）。
+**5.6.2 费用弹框与按钮规则**
 
-**5.5.3 结束到货（新增功能）**
+| 单据类型 | 按钮可见状态 | 可编辑字段 | 发货前校验 |
+| --- | --- | --- | --- |
+| 调拨单类（集货/海外调拨→非FBA） | 仅【待发货】 | 物流费(实际)、其他费(实际) | **未保存费用禁止发货**；合计=0 二次确认 |
+| 备货单类（移库→非FBA平台仓或第三方仓） | 待发货+已发货 | 预估两项+实际两项 | 不校验（可后补，建议发货前录入） |
+| FBA发货单类 | 待发货+已发货 | 预估两项+实际两项 | 不校验（可后补，PRD） |
+
+弹框结构同 V1（主单信息/物流计划与SO/重量汇总/分摊方式/费用编辑/下方发货单分摊预览；【确定】覆盖写入；批量保存范围见 A-5）。
+
+**5.6.3 费用同步领星**
+
+| 单据类型 | 同步方式 |
+| --- | --- |
+| 调拨单类 | 费用仅在 AddAllocationOrder 创建时随单提交，**创建后不可更改**（中台侧费用编辑仅限发货前） |
+| 备货单类 | 创建时随传（旧版 logistics_list）；发货后每次【确定】调 **UpdateLogistics 覆盖重推**（支持预估+实际） |
+| FBA发货单类 | 创建时随传（head_logistics_list）；发货后每次【确定】调 **updateListLogistics 覆盖重推** |
+
+覆盖式接口注意事项：预估/实际两组必须每次完整传（不传即置空）；费用同步失败进重试，中台费用记录不受影响；费用同步任务与单据创建任务独立（单据未创建成功时费用同步任务等待其完成）。
+
+**5.6.4 updateListLogistics / UpdateLogistics 参数组装（FBA发货单）**
 
 ```text
-入口：收货单列表【结束到货】按钮（状态=待收货/部分收货 可见）
-中台处理（事务）：
-  1. receive_status → 已收货(10)
-  2. 明细 cancel_qty = quantity - receivedQty（未收货部分），原"未收货"清零
-  3. 已收货数、取消数回写发货单（shipment_item.receivedQty 不变，记录取消口径待确认 A-6）
-  4. 发货单不再需要继续下推收货单（该收货链路关闭）
-领星处理：
-  调拨单类 → finishReceiveAllocationOrder(order_sn)；失败进重试队列
-  FBA发货单类 → 不处理（PRD：领星上无需处理）
+order_sn / overseas_order_no = 领星单号
+logistics_list_type = 1（新版；备货单 UpdateLogistics 同理，新版字段一致）
+head_logistics_list:
+  tracking_list = []（SO号是否作为跟踪号同步：C-8 维持本期不同步，仅备注携带）
+  estimate_expenses_list: logistics_fee=预估物流费，other_fee_arr=[{fee_type_id=默认其他费类型,
+      other_amount=预估其他费}]，price/币种按 C-7 口径
+  actual_expenses_list: logistics_fee=实际物流费，weight=总实重，volume=总体积(m³)，
+      tax_fee=0，other_fee_arr=实际其他费
 ```
 
-**5.5.4 收货单列表调整**：【未收货】文案改【待收货】；状态筛选改多选；列表与明细弹框增加【取消数】列。
+**5.6.5 页面展示**：列表【预估物流费】【实际物流费】列取费用表合计；查看弹框【物流费用】页签含同步状态与失败原因。
 
-### 5.6 退运同步
+### 5.7 收货同步（V2：三类）
 
-触发点：在途退运单创建成功（`ReturnOnroadServiceImpl.createReturnOnroad` 事务提交后异步执行领星撤销；退运单记录关联的发货单→领星单据）。
+中台收货事务一律先行完成，领星调用异步+重试（失败不回滚中台）。
 
-**5.6.1 FBA发货单类**
+| 中台动作 | 调拨单类 | 备货单类 | FBA发货单类 |
+| --- | --- | --- | --- |
+| 手动签收（分批） | partlyReceiveAllocationOrder：order_sn + product_list(product_id, received_good_num=本次签收数) | inboundBatchesReceipt：overseas_order_no + product_list(product_id, current_receive_num) | 不调领星（FBA自动收货） |
+| 全部收货 | receiveAllocationOrder(orderSnMany) | （累计分批至全量即可；如需一次性全部收货无对应接口，维持分批） | 不调领星 |
+| 结束到货 | finishReceiveAllocationOrder(order_sn) | inboundCompleteReceipt(overseas_order_no) | 不调领星 |
+| 领星入库单号回写 | 收货后查 getStorageAllocationList 取 inbound_order_sn(IB) 回写 | 备货单本身即入库单（OWS*），直接展示 | — |
 
+- product_id 来源：建单时缓存的 `t_lx_product_map`（缺失则任务待数据补齐，补齐后重试）。
+- 分批收货数量以中台本次签收数为准；领星侧累计收货数与中台对账（对账 job）。
+
+**中台【结束到货】功能**（同 V1，补充备货单分支）：
 ```text
-调 InvalidShipmentSn：
-  shipmentNos = [lx_order_sn]
-  isReturnStock = 1（恢复产品库存）、isReturnStockAux = 0（辅料不恢复）
-  cancelReason = "中台退运：" + 退运单号
-成功 → 关联记录 sync_status=4（已作废）
-失败 → 重试队列 + 告警
-作废后：货件可再次下推新发货单 → 发货时创建新的领星单（新关联记录，旧记录保留已作废）
+入口：收货单（状态=待收货/部分收货）【结束到货】
+中台事务：receive_status→已收货(10)；明细 cancel_qty=quantity-receivedQty（未收货清零）；
+  已收货数与取消数回写发货单明细；该收货链路关闭（无需继续下推）
+领星异步：调拨单→结束到货；备货单→结束到货；FBA发货单→不处理
 ```
 
-**5.6.2 调拨单类（待收货无法直接撤销 → 两步法）**
+### 5.8 退运同步（V2：支持部分退运）
 
+触发：在途退运单（ReturnOnroad）事务提交后，按发货单关联的领星单据类型投递撤销任务。退运支持部分（整箱倍数），领星侧按**实际退运数量**处理。
+
+**5.8.1 FBA发货单类**
 ```text
-步骤1（断点 RECEIVED）：receiveAllocationOrder(order_sn) 将原调拨单全部收货
-步骤2（断点 REVERSED）：AddAllocationOrder type=1（简易调拨，创建即完成）：
-   sys_wid = 原目的仓（领星wid）、sys_to_wid = 原始发仓（领星wid）
-   product_list = 原调拨单 SKU 与数量（退运数量口径待确认 B-7：按原单数量还是退运数量）
-   freight_fee/other_fee = 0，remark = "退运归还：" + 退运单号 + "，原单：" + lx_order_sn
-两步写入同一重试任务，支持断点续做；全部完成后关联记录置已作废
+全部退运（退运数=发货数）：
+  InvalidShipmentSn(shipmentNos=[SP*], isReturnStock=1, isReturnStockAux=0,
+      cancelReason=中台退运单号) → 关联记录置已作废；后续可由货件重新下推发货单重建
+部分退运（B-11 待确认，建议方案）：
+  1) InvalidShipmentSn 作废原单（领星全量恢复库存）
+  2) 按剩余数量（发货数-退运数）走 CREATE_FBA_SHIPMENT 重建新发货单（复用 5.4 流程，
+     新 request_flag、新关联记录；备注附"退运重建：原单SP*"）
+  3) 库存净效应：恢复全量-扣减剩余=恢复退运部分，与中台一致
 ```
 
-> 该两步法与人工 SOP 一致（PRD 20260819 新增章节）。若领星后续开放待收货调拨单撤销接口，可简化为单接口。
+**5.8.2 调拨单类（按退运数量部分处理）**
+```text
+步骤1（断点 RECEIVED）：partlyReceiveAllocationOrder
+   order_sn=原调拨单，product_list=退运SKU及退运数量（received_good_num=退运数）
+   —— 即"中台退运多少就在领星收货多少"（目的仓入账该部分）
+步骤2（断点 REVERSED）：AddAllocationOrder type=1（简易调拨，创建即完成）
+   sys_wid=原目的仓、sys_to_wid=原始发仓（领星本地仓映射）
+   product_list=退运SKU及退运数量；费用0；remark="退运归还：退运单号，原单：TF*"
+   —— 反向调拨同数量，把该部分库存归还始发仓
+两步同一任务断点续做；完成后关联记录标注退运处理完成
+剩余未退运数量：原调拨单仍为待收货，继续走正常收货流程
+```
 
-### 5.7 发货单截单（与领星无交互）
+**5.8.3 备货单类（方案待定，B-15）**
+领星无"海外仓→本地仓"反向接口，待收货备货单亦不可删除。候选方案：
+1. 领星侧按退运数量 batchesReceipt 收进海外仓，其后物理退回由业务在领星线下处理（领星账暂挂海外仓）；
+2. 中台侧正常退运，领星侧不处理并告警人工。
+**本期实现**：备货单退运仅记录+告警转人工，不做自动同步（待业务确认方案后补充）。
 
-截单（cancel）仅发生在【待发货】状态，此时领星执行单据尚未创建（最晚时机同步原则），故**截单无需调用领星**。现有 `resetAllocateToWaitPush`（截单后调拨计划回退待推单）逻辑已实现，PRD 该项需求确认是否已满足（C-9）。
+### 5.9 发货单截单
 
-## 6. 前端改造清单（xzy-erp-ui）
+截单仅发生在【待发货】，此时领星执行单据尚未创建（最晚时机同步），**截单无需调领星**；截单产生的同步任务（如有未执行的）随单据删除一并作废。现有 `resetAllocateToWaitPush`（截单后调拨计划回退待推单）已实现，本期仅回归（C-9）。
+
+## 6. 前端改造清单（xzy-erp-ui，V2）
 
 | 页面/组件 | 改造内容 |
 | --- | --- |
-| `views/wms/shipment/index.vue`（调拨发货单列表） | ①【目的仓】右侧新增【领星单据】列：展示最新有效领星单号（已作废单灰色标注），hover 弹框展示：单据类型、领星单号、同步状态、领星单据状态、预估/实际物流费、失败原因；②【领星单据】右侧新增【预估物流费】【实际物流费】列；③操作列新增【物流费用】按钮（按 5.4.3 规则显隐）；④【同步中】锁定态禁用发货/截单/编辑按钮 |
-| `views/wms/shipment/dialog.vue`（查看弹框） | 新增【物流费用】页签 |
-| 新增 `views/wms/shipment/feeDialog.vue` | 物流费用弹框（两种形态：调拨单类/发货单类） |
-| `views/wms/receiptNew/**`（收货单） | 状态文案【未收货】→【待收货】；状态筛选改多选；列表+明细新增【取消数】列；新增【结束到货】按钮+确认弹框 |
-| `views/wms/inbound/**`（入库单列表） | 【备注】右侧新增【领星单据】列（领星IB单号，可点击/悬浮展示） |
-| `src/api/wms/shipment.ts` 等 | 新增费用查询/保存/分摊预览、结束到货、领星单据详情接口 |
+| `views/wms/shipment/index.vue` | ①【领星单据】列：最新有效领星单号（类型图标：调拨单/FBA发货单/备货单；已作废灰色），hover 弹框展示类型、单号、同步状态、预估/实际物流费、失败原因；②【预估物流费】【实际物流费】列；③操作列【物流费用】按钮（按 5.6.2 显隐）；④同步状态标识（待同步/同步中/同步失败-重试中/待数据补齐），失败提供【重试】按钮 |
+| `views/wms/shipment/dialog.vue` | 新增【物流费用】页签 |
+| 新增 `views/wms/shipment/feeDialog.vue` | 费用弹框（三类形态共用，字段按类型控制） |
+| `views/wms/receiptNew/**` | 【未收货】→【待收货】；状态筛选多选；列表+明细【取消数】列；【结束到货】按钮+确认弹框 |
+| `views/wms/inbound/**` | 【备注】右侧【领星单据】列（领星IB单/备货单号） |
+| `src/api/wms/*.ts` | 新增：费用查询/保存/分摊预览、结束到货、领星单据详情、手动重试 |
 
-## 7. 异常处理、重试与监控
+## 7. 异常处理、重试与监控（V2）
 
-### 7.1 异常分级与处理
+### 7.1 异常分级（全部不阻断中台）
 
 | 级别 | 场景 | 处理 |
 | --- | --- | --- |
-| 阻断级 | 发货时领星建单失败、映射缺失、关键数据缺失（店铺/shipmentId/fnsku） | 发货操作直接失败并提示原因；中台不做任何状态变更 |
-| 补偿级 | 收货/结束到货/退运/费用同步领星失败 | 中台操作正常完成；失败写入 `t_lx_retry_task`，job 按退避策略重试（1min/5min/30min/2h/6h...），超次数告警转人工 |
-| 告警级 | CreateSendedOrder 轮询 24h 无结果、阶段2事务失败产生领星孤儿单、token 刷新失败、对账差异 | 即时告警（工作台消息；钉钉机器人待确认 C-10）+ 日志留痕 |
+| 自动重试 | 网络/超时/限流/领星内部错误 | 退避重试（1min/5min/30min/2h/6h...），上限次数后告警转人工 |
+| 待数据补齐 | 仓库/店铺/产品映射缺失、fnsku/shipmentId 缺失、领星库存不足、参数业务错误 | 暂停自动重试；告警展示原因；数据补齐后手动重试（或随基础数据刷新自动重试一次） |
+| 告警转人工 | 重试超限、FBA结果24h未出、对账差异、token 刷新失败 | 工作台消息+日志（钉钉机器人待确认 C-10） |
 
-### 7.2 Token 异常
+### 7.2 Token 与幂等（同 V1，落 openapi 侧）
 
-- access_token 失效（响应鉴权错误码）→ 立即用 refresh_token 刷新并重放一次原请求；
-- refresh_token 只能使用一次：刷新成功后新 token 对原子写库（加锁防并发双刷新）；
-- 刷新仍失败 → 重新走 GetToken（appId/appSecret），并告警提示检查凭据。
+- access_token 提前刷新；refresh_token 一次性、原子更新；失败重走 GetToken+告警。
+- 幂等：request_flag（FBA）、inbound_order_no=发货单号（备货单）、任务乐观锁+查重（调拨单）。
 
-### 7.3 幂等设计
+### 7.3 定时任务（xxl-job）
 
-| 操作 | 幂等保障 |
-| --- | --- |
-| CreateSendedOrder | request_flag 唯一；超时续查只查不重发；锁定态禁止二次发货 |
-| AddAllocationOrder | 无原生幂等参数 → 预写关联记录(同步中)+发货分布式锁(现有 ALLOCATE_SHIPMENT_LOCK_KEY)保证同一发货单串行；调用前先查该发货单是否已有成功记录 |
-| 收货/结束到货/退运/费用 | 重试任务按 (biz_type,biz_id) 唯一；执行前校验领星侧单据当前状态（查 getStorageAllocationList）防重复操作 |
+| Job | 频率 | 职责 | 所在服务 |
+| --- | --- | --- | --- |
+| lxTokenRefreshJob | 100分钟 | token 提前刷新 | openapi |
+| lxSyncTaskJob | 1分钟 | 扫描同步任务执行/续查/重试 | wms |
+| lxBaseDataSyncJob | 每日02:00 | 店铺/仓库/渠道/费类/产品映射刷新 | wms（经Feign） |
+| lxReconcileJob | 每日06:00 | 对账：应同步单据 vs 关联记录；领星单状态抽查（调拨单列表接口）；库存差异提示 | wms |
 
-### 7.4 定时任务（xxl-job）
+## 8. 测试要点（V2）
 
-| Job | 频率 | 职责 |
-| --- | --- | --- |
-| lxTokenRefreshJob | 每 100 分钟 | access_token 提前刷新（有效期约2小时） |
-| lxResultPollJob | 每 30 秒 | 续查【同步中】发货单的 searchProcessResult |
-| lxRetryJob | 每 1 分钟 | 扫描重试任务执行 |
-| lxBaseDataSyncJob | 每日 02:00 | 刷新店铺/仓库/渠道/其他费类型缓存 |
-| lxReconcileJob | 每日 06:00 | 对账：应同步单据 vs 关联记录；领星调拨单状态与中台收货状态比对 |
-
-## 8. 测试要点
-
-1. **三类调拨全链路**：集货调拨（0费用）/ 海外调拨（含费用）/ FBA 各走一遍：发货→领星建单→（部分）收货→结束到货→退运→重建。
-2. **费用**：体积重/计费重两种分摊；预估+实际费用；发货前录入随单提交；发货后修改触发 updateListLogistics 覆盖；费用=0 二次确认；领星侧核对费用值。
-3. **异常与重试**：发货时领星报错（映射缺失/库存不足/参数错）→ 阻断且中台无脏状态；CreateSendedOrder 超时→锁定态→续查成功自动出库 / 续查失败解锁；收货后领星宕机→重试队列补偿成功；退运两步法中断→断点续做。
-4. **幂等与并发**：同一发货单双击发货；重试期间人工再次触发；refresh_token 并发刷新。
-5. **限流**：连续多单发货/收货，验证串行队列不触发领星限流报错。
-6. **展示**：领星单据列/悬浮框/费用列/页签/收货单取消数/入库单IB单号 与数据一致。
-7. **数据核对**：领星侧库存增减与中台出库/入库/退运逐笔核对（对账脚本）。
+1. **三类单据全链路**：调拨单（集货0费用/海外含费用）、备货单、FBA发货单 各走：发货→领星建单→分批收货→全部收货/结束到货→退运（全部+部分）→重建。
+2. **费用**：体积重/计费重分摊；调拨单发货前强制+0费用确认；备货单/发货单后补费用触发覆盖重推（领星侧核对金额与覆盖语义）；费用同步失败重试。
+3. **非阻断验证**：领星接口全部失败场景下（停服/错参/无映射），中台发货/收货/退运均正常完成；同步状态正确展示；补齐后手动重试成功。
+4. **幂等与并发**：任务重复执行不重复建单（request_flag/inbound_order_no/查重）；双击发货；重试与手动重试并发。
+5. **部分退运**：调拨单退运部分数量→领星收货该数量+反向调拨同数量；剩余数量正常收货；FBA部分退运作废+重建后数量正确。
+6. **限流与批量**：连续多单串行通过，不触发领星限流。
+7. **展示一致性**：领星单据列/悬浮框/费用列/页签/取消数/IB单。
+8. **对账**：领星库存增减与中台出入库逐笔核对。
 
 ## 9. 上线方案
 
-1. **配置先行**：凭据、仓库映射、店铺核对、默认物流商渠道、其他费类型在上线前配置完毕并走一次冒烟（手工触发一次建调拨单+作废）。
-2. **灰度顺序**：先集货调拨（0费用、流程最简）→ 海外调拨（费用链路）→ FBA发货单（异步链路最复杂）；按调拨计划分类开关控制。
-3. **存量策略**：上线前已存在的调拨计划/发货单不追溯同步；仅上线后新下推的发货单走新流程（以 `lx_doc_type` 是否有值区分）。
-4. **回滚**：同步开关关闭后发货回退为纯中台流程（不建领星单）；已建领星单按人工 SOP 处理。
-5. **观察期**：上线后一周每日人工核对对账 job 输出；确认无差异后转常态监控。
+1. **配置先行**：凭据、签名、仓库映射（本地仓/海外仓）、店铺核对、默认物流商渠道、其他费类型；冒烟一次三类建单+作废/删除。
+2. **灰度顺序**：调拨单（流程最简）→ 备货单 → FBA发货单（异步链路最复杂）；按分类开关控制。
+3. **存量策略**：仅上线后新下推发货单走新流程；存量不追溯。
+4. **回滚**：关闭同步开关后发货回退纯中台流程；已建领星单按人工 SOP 处理。
+5. **观察期**：一周每日核对对账 job 输出，无差异转常态监控。
 
-## 10. 附：关键代码落点（改造参考，不含代码实现）
+## 10. 附：关键代码落点（改造参考，不含实现）
 
 | 模块 | 位置 | 说明 |
 | --- | --- | --- |
-| 发货分支 | `xzy-erp-public/xzy-wms/.../service/impl/ShipmentServiceImpl.java#shipping` | 按 `lx_doc_type` 增加领星同步分支 |
-| 截单 | 同上 `#cancel` | 无需调领星（最晚时机同步） |
-| 收货 | `.../controller/ReceiptNewController.java#receive/receiveAll` + `ReceiptNewServiceImpl` | 收货后异步触发领星调拨单收货 |
-| 结束到货 | `ReceiptNewController` 新增 `finishReceive` | 中台状态+取消数+领星结束到货 |
-| 退运 | `.../service/impl/ReturnOnroadServiceImpl.java#createReturnOnroad` | 事务提交后触发领星撤销 |
-| 调拨计划 | `AllocateServiceImpl` 创建/保存处 | 分类打标 |
-| 发货单生成 | `createShipmentByAllocate` | 继承分类、冗余字段 |
-| 前端 | `xzy-erp-ui/src/views/wms/shipment/**、receiptNew/**、inbound/**` | 见第 6 节 |
+| Feign 契约 | `xzy-erp-private/xzy-openapi-api/.../remote/RemoteLingxingService.java`（新增）+ req/resp DTO | 约18方法 |
+| 领星客户端 | `xzy-openapi` 服务（独立仓库）：controller + lingxing client/token/签名/限流 + `t_lx_sync_log` | 跨仓库，见 C-12 |
+| 发货编排 | `xzy-wms .../service/impl/ShipmentServiceImpl.java#shipping` 事务后投递同步任务 | 不改中台事务本身 |
+| 收货编排 | `ReceiptNewController#receive/receiveAll` + 新增 `finishReceive` | 事务后异步 |
+| 退运编排 | `ReturnOnroadServiceImpl#createReturnOnroad` 事务后异步 | |
+| 调拨计划 | `AllocateServiceImpl` 创建/保存处分类打标；`createShipmentByAllocate` 继承 | |
+| 同步执行 | 新增 `LingXingSyncService`（任务领取/Feign调用/回写）+ `LingXingSyncTaskJob` | wms |
+| 前端 | `xzy-erp-ui/src/views/wms/shipment/**、receiptNew/**、inbound/**` | 第 6 节 |
 
 ## 相关知识
 
@@ -688,4 +698,5 @@ data[0].head_logistics_list:
 
 ## 变更记录
 
-- 2026-09-01 初稿（需求与方案确认阶段，未改代码）
+- 2026-09-01 V1 初稿
+- 2026-09-02 V2：备货单纳入范围；架构改为 xzy-openapi 客户端+Feign；一致性策略改为"领星失败不阻断中台+异步重试"；退运支持部分数量（调拨单部分收货+反向调拨同数量）；分类条件明确平台仓（FBA=平台仓且平台=亚马逊）与第三方仓表达；费用三类行为（调拨单不可改/备货单可覆盖/发货单可覆盖）；新增备货单全套接口与流程、新增待确认 B-11~B-17
