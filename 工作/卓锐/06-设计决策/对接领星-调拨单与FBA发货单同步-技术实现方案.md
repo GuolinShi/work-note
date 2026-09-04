@@ -715,3 +715,12 @@ head_logistics_list:
   3. 费用弹框：录入费用后下方发货单列表动态预览分摊结果（预估+实际）
   4. 查看弹框【物流费用】页签：不展示SKU明细，仅展示同一物流批次费用总和 + 当前发货单分摊费用
   5. 实体 `LogisticsFee` 的领星同步字段（lxSyncStatus/lxSyncTime/lxError/delFlag）按人工评审意见暂时注释，DDL 列保留待同步阶段启用
+
+- 2026-09-04 V2.3（中台【结束到货】功能已实现，M6.4 中台侧；领星同步推送仍为后续阶段）：
+  1. 数据模型：`t_wms_receipt_item` / `t_wms_shipment_item` / `t_wms_box_item` 新增 `cancel_qty`（已取消数量）；SQL 见 `xzy-erp-public/sql/finish_arrival_20260904.sql`
+  2. 箱子状态：`BoxStatusEnum` 新增 部分取消(-2)、已取消(3)。结束到货时按箱内取消数量赋值：取消数=箱子总数→已取消；小于总数→部分取消（产品确认 2026-09-04）
+  3. 取消口径：取消数=未收货数量=发货数量-已收货-已退运-已取消；收货单置已收货；取消数回写发货单明细
+  4. 新增出库单据类型『结束到货』：`BoundTypeEnum.FINISH_ARRIVAL_OUTBOUND(-9)` + `FinishArrivalOutboundServiceImpl`，按发货单生成出库单扣减目的仓在途库存（总库存/私有库存日志 + `inventory_batch_onroad.onroad_qty`，可扣上限=onroad_qty-receipt_qty）
+  5. 退运可退数量口径更新为：发货数-已签收-已退运-已取消（产品确认 2026-09-04），后端校验、退运弹窗与箱子分摊同步调整；部分取消箱子仍可退运剩余在途数量
+  6. 前端：收货单列表【结束到货】按钮（未收货/部分收货且有未收数量时显示）+取消数列；收货单详情/签收弹窗/发货单详情/退运弹窗增加已取消数量展示；出库单业务类型下拉自动包含『结束到货』
+  7. 权限：新增按钮权限 `wms:receiptNew:finishReceive`（需在各环境配置菜单按钮）；字典 `wms_box_status` 需补充 -2/3 两项
